@@ -1,6 +1,6 @@
-/* netscout.css - minimal theme styles for Net-Scout */
+/* netscout.css - theme and UI styles for Net-Scout */
 
-/* Default (dark) */
+/* Dark theme defaults */
 :root {
   --bg: #0b3d91;
   --topbar-text: #ffffff;
@@ -8,9 +8,12 @@
   --panel-text: #e6eef8;
   --muted: rgba(255,255,255,0.75);
   --table-border: rgba(255,255,255,0.06);
+  --btn-primary: #1e90ff;
+  --btn-secondary: #6c757d;
+  --popup-bg: rgba(0,0,0,0.6);
 }
 
-/* Light theme overrides */
+/* Light theme overrides (applied when documentElement has data-theme="light") */
 [data-theme="light"] {
   --bg: #f8f9fa;
   --topbar-text: #111;
@@ -18,6 +21,17 @@
   --panel-text: #111;
   --muted: rgba(0,0,0,0.6);
   --table-border: rgba(0,0,0,0.08);
+  --btn-primary: #0b5ed7;
+  --btn-secondary: #6c757d;
+  --popup-bg: rgba(255,255,255,0.9);
+}
+
+/* Global */
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+  background: var(--panel-bg);
+  color: var(--panel-text);
 }
 
 /* Topbar */
@@ -27,10 +41,43 @@
   padding: 10px;
   display: flex;
   align-items: center;
+  gap: 12px;
+}
+
+/* Controls */
+#controls .btn {
+  background: var(--btn-primary);
+  color: #fff;
+  border: none;
+  padding: 6px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+#controls .btn.secondary {
+  background: var(--btn-secondary);
+}
+
+/* Status bars */
+.status-bar {
+  width: 260px;
+  background: rgba(255,255,255,0.04);
+  border-radius: 6px;
+  overflow: hidden;
+  height: 12px;
+  margin-left: 8px;
+  border: 1px solid var(--table-border);
+}
+.status-fill {
+  height: 100%;
+  background: linear-gradient(90deg,#ff6b6b,#ffb86b);
+  width: 0%;
+  transition: width 0.6s ease;
 }
 
 /* Map container */
 #map {
+  height: 55vh;
+  width: 100%;
   background: #111;
 }
 
@@ -43,19 +90,28 @@
 }
 
 /* Table */
+#alertsTable {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+}
 #alertsTable thead th {
   color: var(--panel-text);
   border-bottom: 1px solid var(--table-border);
+  padding: 8px;
+  text-align: left;
+  font-weight: 600;
 }
 #alertsTable tbody td {
   padding: 6px;
   color: var(--panel-text);
   border-bottom: 1px solid var(--table-border);
+  vertical-align: top;
 }
 
 /* Buttons */
 .btn {
-  background: #1e90ff;
+  background: var(--btn-primary);
   color: #fff;
   border: none;
   padding: 6px 10px;
@@ -63,13 +119,22 @@
   cursor: pointer;
 }
 .btn.secondary {
-  background: #6c757d;
+  background: var(--btn-secondary);
 }
 
-/* Small */
+/* Small button style */
 .small {
   font-size: 0.9rem;
   padding: 4px 8px;
+}
+
+/* Filters */
+.filter-input {
+  padding: 6px;
+  border-radius: 4px;
+  border: 1px solid var(--table-border);
+  background: transparent;
+  color: var(--panel-text);
 }
 
 /* Popup styling (Leaflet) */
@@ -79,16 +144,27 @@
   border-radius: 4px;
   margin: 6px 0;
   color: var(--panel-text);
+  max-width: 320px;
+  white-space: pre-wrap;
 }
 
-/* Ensure theme toggles look OK */
-.theme-toggle button {
-  background: transparent;
-  border: 1px solid rgba(255,255,255,0.08);
-  color: inherit;
-  border-radius: 4px;
-  padding: 6px 8px;
+/* Enrichment cache page */
+pre.result {
+  max-height: 120px;
+  overflow: auto;
+  background: rgba(0,0,0,0.05);
+  padding: 8px;
+  border-radius: 6px;
+  color: var(--panel-text);
 }
-[data-theme="light"] .theme-toggle button {
-  border: 1px solid rgba(0,0,0,0.08);
+
+/* Responsive tweaks */
+@media (max-width: 900px) {
+  #topbar { flex-direction: column; align-items: stretch; gap: 8px; }
+  .status-bar { width: 180px; }
+  #map { height: 50vh; }
+  #alerts { height: 40vh; }
 }
+
+/* Utility */
+.muted { color: var(--muted); font-size: 0.9rem; }
