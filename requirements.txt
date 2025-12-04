@@ -1,0 +1,2 @@
+# net-scout minimal Python dependencies
+requests>=2.28.0   # optional; used by passive-DNS wrapper in enrich.py
