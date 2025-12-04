@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-net-scout UI (Flask app) - updated with status, filters, enrichment cache, snooze, and bulk enrich.
+net-scout UI (Flask app) - updated with logs API and fixed progress logic.
 
 Run from net-sentinel/net-scout:
   python3 ui.py
-
 Open http://127.0.0.1:5001/netscout
 """
 
@@ -17,7 +16,7 @@ import threading
 import shlex
 import time
 import glob
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, render_template, abort
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -38,9 +37,13 @@ def utc_now_z():
 def run_subprocess_async(cmd_args, out_file=None):
     def target():
         try:
-            os.makedirs(os.path.dirname(out_file), exist_ok=True) if out_file else None
-            with open(out_file, "a") if out_file else subprocess.DEVNULL as f:
-                proc = subprocess.Popen(cmd_args, stdout=f, stderr=subprocess.STDOUT)
+            if out_file:
+                os.makedirs(os.path.dirname(out_file), exist_ok=True)
+                with open(out_file, "a") as f:
+                    proc = subprocess.Popen(cmd_args, stdout=f, stderr=subprocess.STDOUT)
+                    proc.wait()
+            else:
+                proc = subprocess.Popen(cmd_args)
                 proc.wait()
         except Exception as e:
             print("Subprocess error:", e)
@@ -48,26 +51,22 @@ def run_subprocess_async(cmd_args, out_file=None):
     t.start()
     return t
 
-def read_log_tail(path, max_lines=200):
+def read_log_tail(path, max_lines=500):
     if not os.path.exists(path):
         return []
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
-            block = 1024
+            block = 4096
             data = b""
             while size > 0 and len(data.splitlines()) <= max_lines:
-                size -= block
-                if size < 0:
-                    block += size
-                    size = 0
+                size = max(0, size - block)
                 f.seek(size)
                 data = f.read() + data
             lines = data.decode(errors="replace").splitlines()[-max_lines:]
             return lines
     except Exception:
-        # fallback simple read
         try:
             with open(path, "r", errors="replace") as f:
                 return f.read().splitlines()[-max_lines:]
@@ -81,7 +80,6 @@ def find_running_tasks():
     """
     tasks = {"scan_running": False, "scan_pids": [], "enrich_running": False, "enrich_pids": []}
     try:
-        # pgrep -f "scout.py"
         out = subprocess.run(["pgrep", "-f", "scout.py"], capture_output=True, text=True)
         if out.returncode == 0 and out.stdout.strip():
             pids = [int(x) for x in out.stdout.split()]
@@ -104,88 +102,98 @@ def parse_scan_log_for_progress(path):
     Parse scan log to estimate progress:
     - look for 'scanning since' (start time)
     - look for 'candidate alerts detected' (total candidates)
-    - count '[INSERTED]' or '[DRY RUN]' lines as processed
+    - count '[INSERTED]' or '[DRY RUN] Alert:' lines as processed
     - detect '[DONE] scan complete' as finished
-    Return dict: {started_at, finished_at, total_candidates, processed, percent, est_remaining_seconds, last_lines}
+    Return dict: {started_at, finished, total_candidates, processed, percent, est_remaining_seconds, last_lines}
     """
-    lines = read_log_tail(path, max_lines=1000)
+    lines = read_log_tail(path, max_lines=2000)
     started_at = None
-    finished_at = None
+    finished = False
     total_candidates = None
     processed = 0
-    last_ts = None
+    timestamps = []
 
     for ln in lines:
         if "scanning since" in ln:
-            # try to extract ISO timestamp after 'scanning since'
             try:
                 part = ln.split("scanning since", 1)[1].strip()
-                # part may be like '2025-12-04T05:58:13.493566Z'
                 started_at = part.split()[0].strip()
             except Exception:
                 pass
         if "candidate alerts detected" in ln:
             try:
-                # e.g., "[INFO] 19 candidate alerts detected"
-                total_candidates = int(''.join(filter(str.isdigit, ln)))
+                # extract integer from line
+                import re
+                m = re.search(r"(\d+)\s+candidate alerts detected", ln)
+                if m:
+                    total_candidates = int(m.group(1))
             except Exception:
                 pass
         if "[INSERTED]" in ln or "[DRY RUN] Alert:" in ln:
             processed += 1
         if "[DONE] scan complete" in ln:
-            finished_at = True
-        # try to parse timestamp at start of line if present (not guaranteed)
-        # fallback: use file mtime
-    # compute percent
+            finished = True
+        # try to parse ISO timestamp at start of line
+        try:
+            ts = ln.strip().split()[0]
+            # naive check for ISO-like timestamp
+            if "T" in ts and ("Z" in ts or "+" in ts):
+                timestamps.append(ts)
+        except Exception:
+            pass
+
     percent = 0
     est_remaining = None
-    if finished_at:
+    if finished:
         percent = 100
         est_remaining = 0
     else:
         if total_candidates:
-            percent = int(min(95, (processed / max(1, total_candidates)) * 100))
-            # estimate remaining: if processed>0, estimate time per processed from log timestamps not available reliably
-            # best-effort: if file mtime and started_at available, estimate elapsed and remaining
+            percent = int(min(100, (processed / max(1, total_candidates)) * 100))
+            # estimate remaining time using timestamps if available
             try:
-                mtime = os.path.getmtime(path)
-                elapsed = time.time() - mtime  # not accurate; fallback to 0
-                # fallback: assume 1s per processed if processed>0
-                if processed > 0:
-                    est_remaining = int(max(0, (total_candidates - processed) * (elapsed / max(1, processed))))
+                if timestamps and started_at:
+                    # use file mtime as fallback for elapsed
+                    elapsed = None
+                    try:
+                        elapsed = time.time() - os.path.getmtime(path)
+                    except Exception:
+                        elapsed = None
+                    # fallback: assume 0.5s per processed if processed>0
+                    if processed > 0:
+                        per_item = elapsed / processed if elapsed and elapsed > 0 else 0.5
+                        est_remaining = int(max(0, (total_candidates - processed) * per_item))
                 else:
                     est_remaining = None
             except Exception:
                 est_remaining = None
         else:
-            # no candidate info; if process running, show 50%
+            # no total info; if process running, show 50; else 0
             tasks = find_running_tasks()
-            if tasks.get("scan_running"):
-                percent = 50
-            else:
-                percent = 0
+            percent = 50 if tasks.get("scan_running") else 0
+
     return {
         "started_at": started_at,
-        "finished": bool(finished_at),
+        "finished": finished,
         "total_candidates": total_candidates,
         "processed": processed,
         "percent": percent,
         "est_remaining_seconds": est_remaining,
-        "last_lines": lines[-20:]
+        "last_lines": lines[-200:]
     }
 
 def parse_enrich_logs_for_progress(log_dir):
     """
     Look for netscout_enrich_*.log files and parse them for enrichment progress.
-    We count 'enriched alert' occurrences and 'enrich started' markers.
+    Count 'enriched alert' occurrences and 'Enriching alert' markers.
     """
     files = glob.glob(os.path.join(log_dir, "netscout_enrich_*.log"))
     total_processed = 0
     total_started = 0
     last_lines = []
     for f in files:
-        lines = read_log_tail(f, max_lines=500)
-        last_lines.extend(lines[-20:])
+        lines = read_log_tail(f, max_lines=1000)
+        last_lines.extend(lines[-100:])
         for ln in lines:
             if "[OK] enriched alert" in ln or "enriched alert" in ln:
                 total_processed += 1
@@ -193,22 +201,20 @@ def parse_enrich_logs_for_progress(log_dir):
                 total_started += 1
     percent = 0
     if total_started:
-        percent = int(min(95, (total_processed / total_started) * 100))
+        percent = int(min(100, (total_processed / total_started) * 100))
     else:
-        # if any enrich process running, show 50
         tasks = find_running_tasks()
-        if tasks.get("enrich_running"):
-            percent = 50
+        percent = 50 if tasks.get("enrich_running") else 0
     return {
         "files": [os.path.basename(f) for f in files],
         "total_started": total_started,
         "total_processed": total_processed,
         "percent": percent,
-        "last_lines": last_lines[-20:]
+        "last_lines": last_lines[-200:]
     }
 
 # -------------------------
-# DB helpers
+# DB helpers (unchanged)
 # -------------------------
 def fetch_alerts_from_db(since=None, limit=500, alert_type=None, src_ip=None, dst_ip=None, min_score=None):
     if not os.path.exists(DB_PATH):
@@ -292,17 +298,12 @@ def api_alerts():
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
-    # Running tasks
     tasks = find_running_tasks()
-    # Scan progress
     scan_progress = parse_scan_log_for_progress(SCAN_LOG)
-    # Enrich progress
     enrich_progress = parse_enrich_logs_for_progress(LOG_DIR)
-    # Last-run times: use file mtime of logs
     last_scan_mtime = None
     if os.path.exists(SCAN_LOG):
         last_scan_mtime = datetime.fromtimestamp(os.path.getmtime(SCAN_LOG), tz=timezone.utc).isoformat().replace("+00:00", "Z")
-    # last enrich file
     enrich_files = glob.glob(os.path.join(LOG_DIR, "netscout_enrich_*.log"))
     last_enrich_mtime = None
     if enrich_files:
@@ -346,14 +347,10 @@ def api_enrich_alert():
 
 @app.route("/api/enrich_bulk", methods=["POST"])
 def api_enrich_bulk():
-    """
-    Body: {"alert_ids": [1,2,3]} or {"limit": 20} to enrich newest N alerts
-    """
     data = request.get_json() or {}
     alert_ids = data.get("alert_ids")
     limit = data.get("limit")
     if alert_ids:
-        # run enrich.py for each id in background (one process per id)
         logs = []
         for aid in alert_ids:
             logpath = os.path.join(LOG_DIR, f"netscout_enrich_{aid}.log")
@@ -362,7 +359,6 @@ def api_enrich_bulk():
             logs.append(logpath)
         return jsonify({"status": "started", "logs": logs})
     elif limit:
-        # run enrich.py --limit N (enrich.py supports --limit)
         cmd = [sys.executable, ENRICH_SCRIPT, "--limit", str(limit)]
         logpath = os.path.join(LOG_DIR, f"netscout_enrich_bulk_{int(time.time())}.log")
         run_subprocess_async(cmd, out_file=logpath)
@@ -372,9 +368,6 @@ def api_enrich_bulk():
 
 @app.route("/api/enrichment_cache", methods=["GET"])
 def api_enrichment_cache():
-    """
-    Return rows from scout_enrichment_cache table (subject, kind, updated_at).
-    """
     if not os.path.exists(DB_PATH):
         return jsonify({"error": f"DB not found at {DB_PATH}"}), 500
     conn = sqlite3.connect(DB_PATH)
@@ -394,9 +387,6 @@ def api_enrichment_cache():
 
 @app.route("/api/snooze_alert", methods=["POST"])
 def api_snooze_alert():
-    """
-    Body: {"alert_id": 42, "action": "snooze"|"false_positive", "duration_minutes": 60}
-    """
     data = request.get_json() or {}
     aid = data.get("alert_id")
     action = data.get("action", "snooze")
@@ -405,20 +395,56 @@ def api_snooze_alert():
         return jsonify({"error": "alert_id required"}), 400
     if action not in ("snooze", "false_positive"):
         return jsonify({"error": "invalid action"}), 400
-
     if not os.path.exists(DB_PATH):
         return jsonify({"error": f"DB not found at {DB_PATH}"}), 500
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     if action == "snooze":
-        until = datetime.now(timezone.utc) + timedelta(minutes=duration)
-        until_iso = until.isoformat().replace("+00:00", "Z")
-        cur.execute("UPDATE scout_alerts SET status = ?, enrichment_json = COALESCE(enrichment_json, '') WHERE id = ?;", ("snoozed", aid))
+        cur.execute("UPDATE scout_alerts SET status = ? WHERE id = ?;", ("snoozed", aid))
     else:
-        cur.execute("UPDATE scout_alerts SET status = ?, enrichment_json = COALESCE(enrichment_json, '') WHERE id = ?;", ("false_positive", aid))
+        cur.execute("UPDATE scout_alerts SET status = ? WHERE id = ?;", ("false_positive", aid))
     conn.commit()
     conn.close()
     return jsonify({"status": "ok", "alert_id": aid, "action": action})
+
+# -------------------------
+# Logs endpoints
+# -------------------------
+@app.route("/api/logs", methods=["GET"])
+def api_logs():
+    """
+    Return list of log files in LOG_DIR sorted by mtime desc.
+    """
+    if not os.path.exists(LOG_DIR):
+        return jsonify({"logs": []})
+    files = glob.glob(os.path.join(LOG_DIR, "*.log"))
+    files_sorted = sorted(files, key=os.path.getmtime, reverse=True)
+    out = []
+    for f in files_sorted:
+        out.append({
+            "name": os.path.basename(f),
+            "path": f,
+            "mtime": datetime.fromtimestamp(os.path.getmtime(f), tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+            "size": os.path.getsize(f)
+        })
+    return jsonify({"logs": out})
+
+@app.route("/api/log_tail", methods=["GET"])
+def api_log_tail():
+    """
+    Query params:
+      name=<basename>  (required)
+      lines=<n>        (optional, default 200)
+    """
+    name = request.args.get("name")
+    lines = int(request.args.get("lines", "200"))
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    path = os.path.join(LOG_DIR, name)
+    if not os.path.exists(path):
+        return jsonify({"error": "log not found"}), 404
+    tail = read_log_tail(path, max_lines=lines)
+    return jsonify({"name": name, "lines": tail})
 
 # -------------------------
 # Enrichment UI page
@@ -431,5 +457,4 @@ def enrichment_cache_ui():
 # Run app
 # -------------------------
 if __name__ == "__main__":
-    # Run on port 5001 to avoid conflict with net-sentinel if it runs on 5000
     app.run(host="0.0.0.0", port=5001, debug=False)
