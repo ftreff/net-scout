@@ -1,6 +1,6 @@
-// netscout.js - client logic for Net-Scout UI
-// Features: map, dark/light theme, filters, auto-refresh, status polling,
-// bulk enrichment, snooze/false-positive, run scan/enrich actions.
+// netscout.js - client logic for Net-Scout UI (patched)
+// Added guards to ensure map and markersLayer exist and call map.invalidateSize()
+// after rendering alerts or when layout changes so the Leaflet map doesn't disappear.
 
 const API_BASE = "/api";
 let map, markersLayer;
@@ -33,6 +33,11 @@ function applyTopbarTheme(theme) {
   }
 }
 
+function ensureMap() {
+  if (!map) initMap();
+  if (!markersLayer && map) markersLayer = L.layerGroup().addTo(map);
+}
+
 function initMap() {
   const theme = getSavedTheme();
   map = L.map("map", { zoomControl: true }).setView([20, 0], 2);
@@ -48,6 +53,18 @@ function initMap() {
   document.getElementById("themeDarkBtn").addEventListener("click", () => switchToTheme("dark"));
   document.getElementById("themeLightBtn").addEventListener("click", () => switchToTheme("light"));
   applyTopbarTheme(theme);
+
+  // Ensure map redraw after initial layout
+  map.whenReady(() => {
+    setTimeout(() => {
+      try { map.invalidateSize(); } catch (e) { /* ignore */ }
+    }, 150);
+  });
+
+  // Recalculate on window resize
+  window.addEventListener("resize", () => {
+    try { if (map && typeof map.invalidateSize === "function") map.invalidateSize(); } catch (e) {}
+  });
 }
 
 function switchToTheme(theme) {
@@ -86,6 +103,8 @@ function buildPopupHtml(a) {
 }
 
 async function loadAlerts() {
+  ensureMap();
+
   const since = document.getElementById("sinceSelect").value;
   const type = document.getElementById("filterType").value;
   const src = document.getElementById("filterSrc").value.trim();
@@ -113,6 +132,8 @@ async function loadAlerts() {
 }
 
 function renderAlerts(alerts) {
+  ensureMap();
+
   markersLayer.clearLayers();
   const tbody = document.querySelector("#alertsTable tbody");
   tbody.innerHTML = "";
@@ -155,6 +176,17 @@ function renderAlerts(alerts) {
       markersLayer.addLayer(marker);
     }
   });
+
+  // Force Leaflet to recalculate size after DOM updates so the map remains visible
+  setTimeout(() => {
+    try {
+      if (map && typeof map.invalidateSize === "function") {
+        map.invalidateSize();
+      }
+    } catch (e) {
+      console.warn("map.invalidateSize() failed", e);
+    }
+  }, 200);
 }
 
 async function runScan(enrich = false, dry_run = false) {
@@ -284,7 +316,7 @@ function updateStatusUI(data) {
 
   // Use numeric percent if available; otherwise fallback to heuristics
   const scanPercent = Number(scan.percent || 0);
-  scanFill.style.width = `${scanPercent}%`;
+  try { if (scanFill) scanFill.style.width = `${scanPercent}%`; } catch (e) {}
   if (tasks.scan_running) {
     scanLabel.textContent = `Running (${scan.processed || 0}/${scan.total_candidates || "?"})`;
   } else if (scan.finished) {
@@ -292,16 +324,16 @@ function updateStatusUI(data) {
   } else {
     scanLabel.textContent = `${scanPercent}%`;
   }
-  lastScan.textContent = data.last_scan_log || "never";
+  if (lastScan) lastScan.textContent = data.last_scan_log || "never";
 
   const enrichPercent = Number(enrich.percent || 0);
-  enrichFill.style.width = `${enrichPercent}%`;
+  try { if (enrichFill) enrichFill.style.width = `${enrichPercent}%`; } catch (e) {}
   if (tasks.enrich_running) {
     enrichLabel.textContent = `Running (${enrich.total_processed || 0}/${enrich.total_started || "?"})`;
   } else {
     enrichLabel.textContent = `${enrichPercent}%`;
   }
-  lastEnrich.textContent = data.last_enrich_log || "never";
+  if (lastEnrich) lastEnrich.textContent = data.last_enrich_log || "never";
 }
 
 function wireUi() {
