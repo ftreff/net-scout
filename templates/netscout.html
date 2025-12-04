@@ -9,14 +9,18 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='netscout.css') }}" />
   <style>
     /* Layout: left content (map + alerts) and right log panel */
-    #mainWrap { display:flex; gap:12px; height: calc(100vh - 160px); padding: 8px; box-sizing: border-box; }
+    #mainWrap { display:flex; gap:12px; height: calc(100vh - 200px); padding: 8px; box-sizing: border-box; }
     #leftCol { flex: 0 0 75%; display:flex; flex-direction:column; gap:8px; }
     #rightCol { flex: 0 0 25%; display:flex; flex-direction:column; gap:8px; background:var(--panel-bg); padding:8px; border-left:1px solid var(--table-border); }
-    #map { height: 55vh; width: 100%; }
+    /* Map height increased to 75vh */
+    #map { height: 75vh; min-height: 420px; width: 100%; }
     #logBox { flex:1; display:flex; flex-direction:column; gap:8px; }
     #logTail { flex:1; background:#0b1220; color:#e6eef8; padding:8px; border-radius:6px; overflow:auto; font-family: monospace; font-size:12px; white-space:pre-wrap; }
     #logControls { display:flex; gap:8px; align-items:center; }
     select, input { padding:6px; border-radius:4px; border:1px solid var(--table-border); background:transparent; color:var(--panel-text); }
+    .control-row { display:flex; gap:8px; align-items:center; }
+    /* small icon button style for auto-zoom (Leaflet control uses leaflet-bar) */
+    .leaflet-bar a.autozoom { font-size:16px; line-height:18px; text-align:center; width:34px; height:34px; display:block; }
   </style>
 </head>
 <body>
@@ -97,9 +101,27 @@
               <input id="minScore" type="number" value="0" min="0" max="100" style="width:64px" class="filter-input" />
               <button id="applyFiltersBtn" class="btn small">Apply</button>
               <button id="clearFiltersBtn" class="btn secondary small">Clear</button>
+
+              <!-- Exclude private src IPs checkbox -->
+              <label style="margin-left:6px; display:flex; align-items:center; gap:6px;">
+                <input id="excludePrivate" type="checkbox" /> <span class="muted">Exclude 192.168.*</span>
+              </label>
             </div>
           </div>
-          <div class="muted">Auto-refresh: <span id="autoRefreshStatus">on (60s)</span></div>
+
+          <div style="display:flex; gap:12px; align-items:center;">
+            <!-- Auto-refresh enable and interval -->
+            <label style="display:flex; align-items:center; gap:6px;">
+              <input id="autoRefreshEnabled" type="checkbox" checked /> <span class="muted">Auto-refresh</span>
+            </label>
+            <select id="refreshInterval" class="filter-input" title="Refresh interval">
+              <option value="30">30s</option>
+              <option value="60" selected>60s</option>
+              <option value="120">120s</option>
+              <option value="300">300s</option>
+            </select>
+            <div class="muted">Auto-refresh: <span id="autoRefreshStatus">on (60s)</span></div>
+          </div>
         </div>
 
         <table id="alertsTable" style="width:100%; border-collapse:collapse; margin-top:8px;">
@@ -144,8 +166,9 @@
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="{{ url_for('static', filename='netscout.js') }}"></script>
+
   <script>
-    // Additional wiring for log panel (calls API endpoints added to ui.py)
+    // Log panel wiring (unchanged)
     (function() {
       async function fetchLogs() {
         try {
@@ -176,7 +199,6 @@
           opt.text = `${l.name} (${l.mtime})`;
           sel.appendChild(opt);
         });
-        // select first
         sel.selectedIndex = 0;
         await refreshLogTail();
       }
@@ -194,7 +216,6 @@
           const data = await res.json();
           if (data.lines) {
             document.getElementById('logTail').textContent = data.lines.join('\n');
-            // scroll to bottom
             const el = document.getElementById('logTail');
             el.scrollTop = el.scrollHeight;
           } else {
