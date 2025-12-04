@@ -1,4 +1,4 @@
-/* netscout.css - theme and UI styles for Net-Scout */
+/* netscout.css - theme and UI styles for Net-Scout (updated dropdown + layout fixes) */
 
 /* Dark theme defaults */
 :root {
@@ -11,9 +11,12 @@
   --btn-primary: #1e90ff;
   --btn-secondary: #6c757d;
   --popup-bg: rgba(0,0,0,0.6);
+  --select-bg: #0b1220;
+  --select-text: #e6eef8;
+  --select-border: rgba(255,255,255,0.06);
 }
 
-/* Light theme overrides (applied when documentElement has data-theme="light") */
+/* Light theme overrides */
 [data-theme="light"] {
   --bg: #f8f9fa;
   --topbar-text: #111;
@@ -24,6 +27,9 @@
   --btn-primary: #0b5ed7;
   --btn-secondary: #6c757d;
   --popup-bg: rgba(255,255,255,0.9);
+  --select-bg: #ffffff;
+  --select-text: #111;
+  --select-border: rgba(0,0,0,0.08);
 }
 
 /* Global */
@@ -77,6 +83,7 @@ body {
 /* Map container */
 #map {
   height: 55vh;
+  min-height: 320px; /* ensure map has a usable height so flex layout doesn't collapse it */
   width: 100%;
   background: #111;
 }
@@ -128,14 +135,21 @@ body {
   padding: 4px 8px;
 }
 
-/* Filters */
-.filter-input {
+/* Filters and selects (important: readable in dark theme) */
+.filter-input,
+select,
+#logSelect,
+input[type="number"] {
   padding: 6px;
   border-radius: 4px;
-  border: 1px solid var(--table-border);
-  background: transparent;
-  color: var(--panel-text);
+  border: 1px solid var(--select-border);
+  background: var(--select-bg);
+  color: var(--select-text);
+  outline: none;
 }
+
+/* Ensure dropdown arrow is visible on dark backgrounds in some browsers */
+select::-ms-expand { color: var(--select-text); }
 
 /* Popup styling (Leaflet) */
 .leaflet-popup-content pre {
@@ -156,6 +170,17 @@ pre.result {
   padding: 8px;
   border-radius: 6px;
   color: var(--panel-text);
+}
+
+/* Log tail box */
+#logTail {
+  background: #07101a;
+  color: var(--panel-text);
+  padding: 8px;
+  border-radius: 6px;
+  overflow: auto;
+  font-family: monospace;
+  font-size: 12px;
 }
 
 /* Responsive tweaks */
