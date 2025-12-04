@@ -1,5 +1,6 @@
-// netscout.js
-// Map + UI logic for Net-Scout (light/dark theme support, dark default)
+// netscout.js - client logic for Net-Scout UI
+// Features: map, dark/light theme, filters, auto-refresh, status polling,
+// bulk enrichment, snooze/false-positive, run scan/enrich actions.
 
 const API_BASE = "/api";
 let map, markersLayer;
@@ -8,14 +9,15 @@ const DARK_TILE = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png
 const LIGHT_TILE = "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png";
 const ATTRIB = '&copy; <a href="https://carto.com/">CartoDB</a> &copy; OpenStreetMap contributors';
 
-function getSavedTheme() {
-  const t = localStorage.getItem("netscout_theme");
-  return t ? t : "dark";
-}
+let ALERTS_POLL_INTERVAL = 60000; // 60s
+let STATUS_POLL_INTERVAL = 10000; // 10s
+let alertsPollTimer = null;
+let statusPollTimer = null;
 
-function setSavedTheme(theme) {
-  localStorage.setItem("netscout_theme", theme);
+function getSavedTheme() {
+  return localStorage.getItem("netscout_theme") || "dark";
 }
+function setSavedTheme(t) { localStorage.setItem("netscout_theme", t); }
 
 function applyTopbarTheme(theme) {
   const topbar = document.getElementById("topbar");
@@ -23,38 +25,28 @@ function applyTopbarTheme(theme) {
   if (theme === "dark") {
     topbar.style.background = "#0b3d91";
     topbar.style.color = "#fff";
+    document.documentElement.setAttribute("data-theme", "dark");
   } else {
     topbar.style.background = "#f8f9fa";
     topbar.style.color = "#111";
+    document.documentElement.setAttribute("data-theme", "light");
   }
-  topbar.setAttribute("data-theme", theme);
 }
 
 function initMap() {
   const theme = getSavedTheme();
-
   map = L.map("map", { zoomControl: true }).setView([20, 0], 2);
 
   lightLayer = L.tileLayer(LIGHT_TILE, { attribution: ATTRIB, maxZoom: 19 });
   darkLayer = L.tileLayer(DARK_TILE, { attribution: ATTRIB, maxZoom: 19 });
 
-  // Default: dark
-  if (theme === "light") {
-    lightLayer.addTo(map);
-  } else {
-    darkLayer.addTo(map);
-  }
+  if (theme === "light") lightLayer.addTo(map);
+  else darkLayer.addTo(map);
 
   markersLayer = L.layerGroup().addTo(map);
 
-  // Theme buttons
-  document.getElementById("themeDarkBtn").addEventListener("click", () => {
-    switchToTheme("dark");
-  });
-  document.getElementById("themeLightBtn").addEventListener("click", () => {
-    switchToTheme("light");
-  });
-
+  document.getElementById("themeDarkBtn").addEventListener("click", () => switchToTheme("dark"));
+  document.getElementById("themeLightBtn").addEventListener("click", () => switchToTheme("light"));
   applyTopbarTheme(theme);
 }
 
@@ -62,73 +54,16 @@ function switchToTheme(theme) {
   setSavedTheme(theme);
   if (!map) return;
   if (theme === "light") {
-    map.removeLayer(darkLayer);
+    if (map.hasLayer(darkLayer)) map.removeLayer(darkLayer);
     lightLayer.addTo(map);
   } else {
-    map.removeLayer(lightLayer);
+    if (map.hasLayer(lightLayer)) map.removeLayer(lightLayer);
     darkLayer.addTo(map);
   }
   applyTopbarTheme(theme);
 }
 
-// Fetch alerts and render markers + table
-async function loadAlerts() {
-  const since = document.getElementById("sinceSelect").value;
-  const minScore = Number(document.getElementById("minScore").value || 0);
-  // Convert simple relative windows to ISO by letting server handle; we pass raw string
-  const url = `${API_BASE}/alerts?since=${encodeURIComponent(since)}&limit=500`;
-  const res = await fetch(url);
-  const data = await res.json();
-  const alerts = data.alerts || [];
-
-  // Clear markers and table
-  markersLayer.clearLayers();
-  const tbody = document.querySelector("#alertsTable tbody");
-  tbody.innerHTML = "";
-
-  alerts.forEach(a => {
-    const score = Number(a.score || 0);
-    if (score < minScore) return;
-
-    // Add table row
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td style="padding:6px">${a.id}</td>
-      <td>${a.alert_type}</td>
-      <td>${a.src_ip || ""}</td>
-      <td>${a.dst_ip || ""}</td>
-      <td>${score}</td>
-      <td>${a.created_at || ""}</td>
-      <td>
-        <button class="small" data-id="${a.id}" data-action="enrich">Enrich</button>
-      </td>
-    `;
-    tbody.appendChild(tr);
-
-    // Wire enrich button
-    tr.querySelector("button[data-action='enrich']").addEventListener("click", () => {
-      enrichAlert(a.id);
-    });
-
-    // Add marker if coordinates exist
-    if (a.latitude && a.longitude) {
-      const color = score >= 80 ? "red" : score >= 50 ? "orange" : "blue";
-      const marker = L.circleMarker([a.latitude, a.longitude], {
-        radius: 8,
-        fillColor: color,
-        color: "#000",
-        weight: 1,
-        opacity: 1,
-        fillOpacity: 0.8
-      });
-
-      const popupHtml = buildPopupHtml(a);
-      marker.bindPopup(popupHtml);
-      markersLayer.addLayer(marker);
-    }
-  });
-}
-
+// Build popup HTML for an alert
 function buildPopupHtml(a) {
   const evidence = a.evidence || {};
   const enrich = a.enrichment || {};
@@ -139,6 +74,7 @@ function buildPopupHtml(a) {
   html += `<b>Src:</b> ${a.src_ip || "N/A"}<br>`;
   html += `<b>Dst:</b> ${a.dst_ip || "N/A"}<br>`;
   html += `<b>When:</b> ${a.created_at || "N/A"}<br>`;
+  html += `<b>Status:</b> ${a.status || "N/A"}<br>`;
   html += `<hr>`;
   html += `<b>Evidence:</b><pre style="white-space:pre-wrap;max-height:120px;overflow:auto;">${JSON.stringify(evidence, null, 2)}</pre>`;
   if (Object.keys(enrich).length) {
@@ -150,38 +86,273 @@ function buildPopupHtml(a) {
   return html;
 }
 
-async function runScan(enrich=false, dry_run=false) {
+// Fetch alerts with filters and render table + markers
+async function loadAlerts() {
+  const since = document.getElementById("sinceSelect").value;
+  const type = document.getElementById("filterType").value;
+  const src = document.getElementById("filterSrc").value.trim();
+  const dst = document.getElementById("filterDst").value.trim();
+  const minScore = document.getElementById("minScore").value || 0;
+  const limit = 500;
+
+  const params = new URLSearchParams();
+  if (since) params.set("since", since);
+  if (type) params.set("type", type);
+  if (src) params.set("src", src);
+  if (dst) params.set("dst", dst);
+  if (minScore) params.set("min_score", minScore);
+  params.set("limit", limit);
+
+  const url = `${API_BASE}/alerts?${params.toString()}`;
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    const alerts = data.alerts || [];
+    renderAlerts(alerts);
+  } catch (err) {
+    console.error("Failed to load alerts", err);
+  }
+}
+
+function renderAlerts(alerts) {
+  markersLayer.clearLayers();
+  const tbody = document.querySelector("#alertsTable tbody");
+  tbody.innerHTML = "";
+
+  alerts.forEach(a => {
+    const score = Number(a.score || 0);
+
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td style="padding:6px">${a.id}</td>
+      <td>${a.alert_type}</td>
+      <td>${a.src_ip || ""}</td>
+      <td>${a.dst_ip || ""}</td>
+      <td>${score}</td>
+      <td>${a.created_at || ""}</td>
+      <td>${a.status || "new"}</td>
+      <td>
+        <button class="small" data-id="${a.id}" data-action="enrich">Enrich</button>
+        <button class="small" data-id="${a.id}" data-action="snooze">Snooze</button>
+        <button class="small" data-id="${a.id}" data-action="fp">Mark FP</button>
+      </td>
+    `;
+    tbody.appendChild(tr);
+
+    tr.querySelector("button[data-action='enrich']").addEventListener("click", () => enrichAlert(a.id));
+    tr.querySelector("button[data-action='snooze']").addEventListener("click", () => snoozeAlert(a.id));
+    tr.querySelector("button[data-action='fp']").addEventListener("click", () => markFalsePositive(a.id));
+
+    if (a.latitude && a.longitude) {
+      const color = score >= 80 ? "red" : score >= 50 ? "orange" : "blue";
+      const marker = L.circleMarker([a.latitude, a.longitude], {
+        radius: 8,
+        fillColor: color,
+        color: "#000",
+        weight: 1,
+        opacity: 1,
+        fillOpacity: 0.8
+      });
+      marker.bindPopup(buildPopupHtml(a));
+      markersLayer.addLayer(marker);
+    }
+  });
+}
+
+// Run scan via API
+async function runScan(enrich = false, dry_run = false) {
   const since = document.getElementById("sinceSelect").value;
   const body = { since, enrich, dry_run };
-  const res = await fetch(`${API_BASE}/run_scan`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  const data = await res.json();
-  alert("Scan started. Check log: " + (data.log || "n/a"));
+  try {
+    const res = await fetch(`${API_BASE}/run_scan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    alert("Scan started. Log: " + (data.log || "n/a"));
+  } catch (err) {
+    console.error("Failed to start scan", err);
+    alert("Failed to start scan");
+  }
 }
 
+// Enrich single alert
 async function enrichAlert(alert_id) {
-  const res = await fetch(`${API_BASE}/enrich_alert`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ alert_id })
-  });
-  const data = await res.json();
-  alert("Enrichment started. Check log: " + (data.log || "n/a"));
+  try {
+    const res = await fetch(`${API_BASE}/enrich_alert`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ alert_id })
+    });
+    const data = await res.json();
+    alert("Enrichment started. Log: " + (data.log || "n/a"));
+  } catch (err) {
+    console.error("Failed to start enrichment", err);
+    alert("Failed to start enrichment");
+  }
 }
 
+// Bulk enrich newest N alerts
+async function bulkEnrichNewest(n) {
+  try {
+    const res = await fetch(`${API_BASE}/enrich_bulk`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: n })
+    });
+    const data = await res.json();
+    alert("Bulk enrichment started. Log: " + (data.log || (data.logs || []).join(", ")));
+  } catch (err) {
+    console.error("Failed to start bulk enrich", err);
+    alert("Failed to start bulk enrich");
+  }
+}
+
+// Snooze alert (simple implementation: set status to snoozed)
+async function snoozeAlert(alert_id) {
+  const duration = prompt("Snooze duration in minutes (default 60):", "60");
+  if (duration === null) return;
+  try {
+    const res = await fetch(`${API_BASE}/snooze_alert`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ alert_id, action: "snooze", duration_minutes: Number(duration || 60) })
+    });
+    const data = await res.json();
+    if (data.status === "ok") {
+      alert("Alert snoozed");
+      loadAlerts();
+    } else {
+      alert("Failed to snooze: " + JSON.stringify(data));
+    }
+  } catch (err) {
+    console.error("Snooze failed", err);
+    alert("Snooze failed");
+  }
+}
+
+// Mark false positive
+async function markFalsePositive(alert_id) {
+  if (!confirm("Mark alert " + alert_id + " as false positive?")) return;
+  try {
+    const res = await fetch(`${API_BASE}/snooze_alert`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ alert_id, action: "false_positive" })
+    });
+    const data = await res.json();
+    if (data.status === "ok") {
+      alert("Marked false positive");
+      loadAlerts();
+    } else {
+      alert("Failed: " + JSON.stringify(data));
+    }
+  } catch (err) {
+    console.error("Mark FP failed", err);
+    alert("Mark FP failed");
+  }
+}
+
+// Poll status endpoint and update UI
+async function pollStatus() {
+  try {
+    const res = await fetch(`${API_BASE}/status`);
+    const data = await res.json();
+    updateStatusUI(data);
+  } catch (err) {
+    console.error("Status poll failed", err);
+  }
+}
+
+function formatSeconds(s) {
+  if (s == null) return "n/a";
+  s = Number(s);
+  if (isNaN(s)) return "n/a";
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  if (m < 60) return `${m}m ${sec}s`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return `${h}h ${mm}m`;
+}
+
+function updateStatusUI(data) {
+  // Scan progress
+  const scan = data.scan_progress || {};
+  const enrich = data.enrich_progress || {};
+  const tasks = data.tasks || {};
+
+  const scanFill = document.getElementById("scanStatusFill");
+  const scanLabel = document.getElementById("scanStatusLabel");
+  const lastScan = document.getElementById("lastScanTime");
+  const enrichFill = document.getElementById("enrichStatusFill");
+  const enrichLabel = document.getElementById("enrichStatusLabel");
+  const lastEnrich = document.getElementById("lastEnrichTime");
+
+  if (scanFill) scanFill.style.width = (scan.percent || 0) + "%";
+  if (scanLabel) {
+    if (tasks.tasks && tasks.tasks.scan_running) {
+      scanLabel.textContent = `Running (${scan.processed || 0}/${scan.total_candidates || "?"})`;
+    } else if (scan.finished) {
+      scanLabel.textContent = "Complete";
+    } else {
+      scanLabel.textContent = (scan.percent || 0) + "%";
+    }
+  }
+  if (lastScan) lastScan.textContent = data.last_scan_log || "never";
+
+  if (enrichFill) enrichFill.style.width = (enrich.percent || 0) + "%";
+  if (enrichLabel) {
+    if (tasks.enrich_running) {
+      enrichLabel.textContent = `Running (${enrich.total_processed || 0}/${enrich.total_started || "?"})`;
+    } else {
+      enrichLabel.textContent = (enrich.percent || 0) + "%";
+    }
+  }
+  if (lastEnrich) lastEnrich.textContent = data.last_enrich_log || "never";
+}
+
+// Wire UI controls
 function wireUi() {
   document.getElementById("runScanBtn").addEventListener("click", () => runScan(false, false));
   document.getElementById("runScanEnrichBtn").addEventListener("click", () => runScan(true, false));
   document.getElementById("refreshBtn").addEventListener("click", () => loadAlerts());
   document.getElementById("sinceSelect").addEventListener("change", () => loadAlerts());
-  document.getElementById("minScore").addEventListener("change", () => loadAlerts());
+  document.getElementById("applyFiltersBtn").addEventListener("click", () => loadAlerts());
+  document.getElementById("clearFiltersBtn").addEventListener("click", () => {
+    document.getElementById("filterType").value = "";
+    document.getElementById("filterSrc").value = "";
+    document.getElementById("filterDst").value = "";
+    document.getElementById("minScore").value = 0;
+    loadAlerts();
+  });
+  document.getElementById("bulkEnrichBtn").addEventListener("click", () => {
+    const n = Number(document.getElementById("bulkEnrichCount").value || 10);
+    if (n <= 0) return alert("Enter a positive number");
+    bulkEnrichNewest(n);
+  });
+
+  // Theme buttons
+  document.getElementById("themeDarkBtn").addEventListener("click", () => switchToTheme("dark"));
+  document.getElementById("themeLightBtn").addEventListener("click", () => switchToTheme("light"));
 }
 
+// Start polling loops
+function startPolling() {
+  if (alertsPollTimer) clearInterval(alertsPollTimer);
+  if (statusPollTimer) clearInterval(statusPollTimer);
+  // initial immediate loads
+  loadAlerts();
+  pollStatus();
+  alertsPollTimer = setInterval(loadAlerts, ALERTS_POLL_INTERVAL);
+  statusPollTimer = setInterval(pollStatus, STATUS_POLL_INTERVAL);
+}
+
+// Initialize on load
 window.addEventListener("load", () => {
   initMap();
   wireUi();
-  loadAlerts();
+  startPolling();
 });
