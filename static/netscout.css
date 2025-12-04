@@ -1,4 +1,4 @@
-/* netscout.css - theme and UI styles for Net-Scout (updated dropdown + layout fixes) */
+/* netscout.css - theme and UI styles for Net-Scout (updated dropdown + popup styles + popup scrollbar) */
 
 /* Dark theme defaults */
 :root {
@@ -10,7 +10,9 @@
   --table-border: rgba(255,255,255,0.06);
   --btn-primary: #1e90ff;
   --btn-secondary: #6c757d;
-  --popup-bg: rgba(0,0,0,0.6);
+  --popup-bg: #07101a; /* darker popup background */
+  --popup-text: #e6eef8; /* readable popup text */
+  --popup-pre-bg: rgba(0,0,0,0.06);
   --select-bg: #0b1220;
   --select-text: #e6eef8;
   --select-border: rgba(255,255,255,0.06);
@@ -26,7 +28,9 @@
   --table-border: rgba(0,0,0,0.08);
   --btn-primary: #0b5ed7;
   --btn-secondary: #6c757d;
-  --popup-bg: rgba(255,255,255,0.9);
+  --popup-bg: #ffffff;
+  --popup-text: #111;
+  --popup-pre-bg: rgba(0,0,0,0.03);
   --select-bg: #ffffff;
   --select-text: #111;
   --select-border: rgba(0,0,0,0.08);
@@ -83,7 +87,7 @@ body {
 /* Map container */
 #map {
   height: 55vh;
-  min-height: 320px; /* ensure map has a usable height so flex layout doesn't collapse it */
+  min-height: 320px;
   width: 100%;
   background: #111;
 }
@@ -135,7 +139,7 @@ body {
   padding: 4px 8px;
 }
 
-/* Filters and selects (important: readable in dark theme) */
+/* Filters and selects */
 .filter-input,
 select,
 #logSelect,
@@ -148,7 +152,7 @@ input[type="number"] {
   outline: none;
 }
 
-/* Ensure the "Window" dropdown uses theme colors and is readable */
+/* Window dropdown specifically */
 #sinceSelect,
 #sinceSelect option {
   background: var(--select-bg) !important;
@@ -160,20 +164,58 @@ input[type="number"] {
   -moz-appearance: none;
   appearance: none;
 }
-
-/* Ensure dropdown arrow is visible on dark backgrounds in some browsers */
 select::-ms-expand { color: var(--select-text); }
 #sinceSelect::-ms-expand { color: var(--select-text) !important; }
 
-/* Popup styling (Leaflet) */
-.leaflet-popup-content pre {
-  background: rgba(0,0,0,0.05);
-  padding: 6px;
-  border-radius: 4px;
-  margin: 6px 0;
-  color: var(--panel-text);
-  max-width: 320px;
+/* Popup styling (Leaflet) - improved readability and vertical scrollbar */
+.leaflet-popup-content-wrapper {
+  background: var(--popup-bg) !important;
+  color: var(--popup-text) !important;
+  border-radius: 8px !important;
+  padding: 8px !important;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.4);
+  max-width: 460px !important;
+  /* ensure popup has a max height and shows vertical scrollbar when content is long */
+  max-height: 420px !important;
+  overflow: hidden !important;
+}
+.leaflet-popup-content {
+  margin: 0 !important;
+  color: var(--popup-text) !important;
+  font-size: 13px;
+  line-height: 1.3;
+  /* inner container scroll area */
+  max-height: 400px;
+  overflow-y: auto;
+  padding-right: 6px; /* space for scrollbar */
+}
+
+/* popup inner pre blocks */
+.ns-pre {
+  background: var(--popup-pre-bg);
+  color: var(--popup-text);
+  padding: 8px;
+  border-radius: 6px;
+  max-height: 160px;
+  overflow: auto;
   white-space: pre-wrap;
+  font-family: monospace;
+  font-size: 12px;
+  margin: 6px 0;
+}
+
+/* popup buttons */
+.ns-btn {
+  background: var(--btn-primary);
+  color: #fff;
+  border: none;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.ns-btn.secondary {
+  background: var(--btn-secondary);
 }
 
 /* Enrichment cache page */
