@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Net-Scout — Investigate Alerts</title>
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-sA+e2kGk0bqk6v3gqk1Qm0Qb0b0gq6Y5f5x5Y5Y5Y5Y=" crossorigin=""/>
+
+  <!-- App CSS -->
+  <link rel="stylesheet" href="{{ url_for('static', filename='netscout.css') }}" />
+
+  <style>
+    body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+    #topbar { display:flex; gap:12px; align-items:center; padding:10px; color:#fff; }
+    #controls { display:flex; gap:8px; align-items:center; }
+    #map { height: 60vh; width: 100%; }
+    #alerts { height: 30vh; overflow:auto; border-top:1px solid #ddd; padding:8px; }
+    .btn { background:#1e90ff; color:#fff; border:none; padding:6px 10px; border-radius:4px; cursor:pointer; }
+    .btn.secondary { background:#6c757d; }
+    .small { font-size:0.9rem; padding:4px 8px; }
+    .theme-toggle { display:flex; gap:6px; align-items:center; }
+    .theme-toggle button { padding:6px 8px; border-radius:4px; border:1px solid rgba(255,255,255,0.08); background:transparent; color:inherit; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <div id="topbar" data-theme="dark" style="background:#0b3d91;">
+    <div style="display:flex; align-items:center; gap:12px;">
+      <h3 style="margin:0; font-weight:600;">Net-Scout</h3>
+      <div style="opacity:0.9; font-size:0.9rem;">Investigate suspicious network activity</div>
+    </div>
+
+    <div style="flex:1"></div>
+
+    <div id="controls">
+      <div class="theme-toggle" title="Map theme">
+        <label style="color:#fff; font-size:0.9rem; margin-right:6px;">Theme</label>
+        <button id="themeDarkBtn" class="small">Dark</button>
+        <button id="themeLightBtn" class="small">Light</button>
+      </div>
+
+      <label for="sinceSelect" style="color:#fff; font-size:0.9rem;">Window</label>
+      <select id="sinceSelect" class="small">
+        <option value="1 hour">Last 1 hour</option>
+        <option value="6 hours">Last 6 hours</option>
+        <option value="12 hours">Last 12 hours</option>
+        <option value="24 hours">Last 24 hours</option>
+        <option value="7 days">Last 7 days</option>
+      </select>
+
+      <button id="runScanBtn" class="btn small">Run Scan</button>
+      <button id="runScanEnrichBtn" class="btn small">Run Scan + Enrich</button>
+      <button id="refreshBtn" class="btn secondary small">Refresh</button>
+    </div>
+  </div>
+
+  <div id="map"></div>
+
+  <div id="alerts">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <strong>Alerts</strong>
+      <div>
+        <label style="margin-right:8px;">Min score</label>
+        <input id="minScore" type="number" value="0" min="0" max="100" style="width:64px" />
+      </div>
+    </div>
+    <table id="alertsTable" style="width:100%; border-collapse:collapse; margin-top:8px;">
+      <thead>
+        <tr style="text-align:left; border-bottom:1px solid #ddd;">
+          <th style="padding:6px">ID</th>
+          <th>Type</th>
+          <th>Src</th>
+          <th>Dst</th>
+          <th>Score</th>
+          <th>When</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-o9N1j8k3Q2b2k3k3k3k3k3k3k3k3k3k3k3k3k3k3k3k=" crossorigin=""></script>
+
+  <!-- App JS -->
+  <script src="{{ url_for('static', filename='netscout.js') }}"></script>
+</body>
+</html>
