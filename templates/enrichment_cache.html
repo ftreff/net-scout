@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Net-Scout — Enrichment Cache</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='netscout.css') }}" />
+  <style>
+    body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+    header { padding: 12px; background: var(--bg, #0b3d91); color: var(--topbar-text, #fff); display:flex; align-items:center; gap:12px; }
+    main { padding: 12px; }
+    table { width:100%; border-collapse:collapse; margin-top:12px; }
+    th, td { padding:8px; border-bottom:1px solid var(--table-border, rgba(255,255,255,0.06)); color:var(--panel-text,#e6eef8); }
+    .btn { background:#1e90ff; color:#fff; border:none; padding:6px 10px; border-radius:4px; cursor:pointer; }
+    .small { font-size:0.9rem; padding:4px 8px; }
+    .muted { opacity:0.85; font-size:0.9rem; }
+    pre.result { max-height:120px; overflow:auto; background:rgba(0,0,0,0.05); padding:8px; border-radius:6px; color:var(--panel-text,#e6eef8); }
+    .controls { display:flex; gap:8px; align-items:center; }
+  </style>
+</head>
+<body>
+  <header>
+    <div style="display:flex; flex-direction:column;">
+      <strong style="font-size:1.1rem;">Net-Scout — Enrichment Cache</strong>
+      <span class="muted">View cached enrichment results and re-run enrichment for related alerts</span>
+    </div>
+    <div style="flex:1"></div>
+    <div class="controls">
+      <button id="backBtn" class="btn small">Back to Net-Scout</button>
+      <button id="refreshCacheBtn" class="btn small">Refresh</button>
+    </div>
+  </header>
+
+  <main>
+    <div style="display:flex; gap:12px; align-items:center;">
+      <label class="muted">Filter subject</label>
+      <input id="filterSubject" placeholder="IP or domain substring" style="padding:6px; border-radius:4px; border:1px solid rgba(0,0,0,0.08);" />
+      <button id="applyFilterBtn" class="btn small">Apply</button>
+    </div>
+
+    <table id="cacheTable" aria-live="polite">
+      <thead>
+        <tr>
+          <th>Subject</th>
+          <th>Kind</th>
+          <th>Updated At</th>
+          <th>Result (truncated)</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </main>
+
+  <script>
+    const API_BASE = "/api";
+
+    async function fetchCache() {
+      try {
+        const res = await fetch(`${API_BASE}/enrichment_cache`);
+        const data = await res.json();
+        return data.cache || [];
+      } catch (e) {
+        console.error("Failed to fetch cache", e);
+        return [];
+      }
+    }
+
+    function renderCache(rows) {
+      const tbody = document.querySelector("#cacheTable tbody");
+      tbody.innerHTML = "";
+      rows.forEach(r => {
+        const tr = document.createElement("tr");
+        const resultPreview = typeof r.result === "object" ? JSON.stringify(r.result, null, 2).slice(0, 800) : String(r.result || "");
+        tr.innerHTML = `
+          <td style="vertical-align:top;"><code>${r.subject}</code></td>
+          <td style="vertical-align:top;">${r.kind}</td>
+          <td style="vertical-align:top;">${r.updated_at || ""}</td>
+          <td style="vertical-align:top;"><pre class="result">${escapeHtml(resultPreview)}</pre></td>
+          <td style="vertical-align:top;">
+            <button class="btn small" data-subject="${r.subject}" data-kind="${r.kind}" data-action="reenrich">Re-enrich alerts</button>
+            <button class="btn small" data-subject="${r.subject}" data-action="findalerts">Find alerts</button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+
+        tr.querySelector("button[data-action='reenrich']").addEventListener("click", async (ev) => {
+          const subj = ev.currentTarget.dataset.subject;
+          await reEnrichAlertsForSubject(subj);
+        });
+        tr.querySelector("button[data-action='findalerts']").addEventListener("click", async (ev) => {
+          const subj = ev.currentTarget.dataset.subject;
+          await showAlertsForSubject(subj);
+        });
+      });
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]; });
+    }
+
+    async function showAlertsForSubject(subject) {
+      // Query alerts where src or dst matches subject (exact or partial)
+      const params = new URLSearchParams();
+      params.set("limit", 200);
+      params.set("src", subject);
+      const res1 = await fetch(`${API_BASE}/alerts?${params.toString()}`);
+      const data1 = await res1.json();
+      const alertsSrc = data1.alerts || [];
+
+      const params2 = new URLSearchParams();
+      params2.set("limit", 200);
+      params2.set("dst", subject);
+      const res2 = await fetch(`${API_BASE}/alerts?${params2.toString()}`);
+      const data2 = await res2.json();
+      const alertsDst = data2.alerts || [];
+
+      const combined = [...alertsSrc, ...alertsDst];
+      if (!combined.length) {
+        alert("No alerts found for subject: " + subject);
+        return;
+      }
+      // Show a simple list and offer to re-enrich them
+      const ids = combined.map(a => a.id);
+      if (confirm(`Found ${ids.length} alerts for ${subject}. Start enrichment for these alerts?`)) {
+        await bulkEnrichByIds(ids);
+      }
+    }
+
+    async function reEnrichAlertsForSubject(subject) {
+      // Find alerts by src or dst equal to subject (exact) first, then partial
+      const params = new URLSearchParams();
+      params.set("limit", 500);
+      params.set("src", subject);
+      const res = await fetch(`${API_BASE}/alerts?${params.toString()}`);
+      const data = await res.json();
+      let alerts = data.alerts || [];
+      if (!alerts.length) {
+        // try dst
+        const p2 = new URLSearchParams();
+        p2.set("limit", 500);
+        p2.set("dst", subject);
+        const r2 = await fetch(`${API_BASE}/alerts?${p2.toString()}`);
+        const d2 = await r2.json();
+        alerts = d2.alerts || [];
+      }
+      if (!alerts.length) {
+        alert("No alerts found for subject: " + subject);
+        return;
+      }
+      const ids = alerts.map(a => a.id);
+      if (!ids.length) {
+        alert("No alert ids to enrich");
+        return;
+      }
+      if (!confirm(`Start enrichment for ${ids.length} alerts related to ${subject}?`)) return;
+      await bulkEnrichByIds(ids);
+    }
+
+    async function bulkEnrichByIds(ids) {
+      try {
+        const res = await fetch(`${API_BASE}/enrich_bulk`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ alert_ids: ids })
+        });
+        const data = await res.json();
+        alert("Enrichment started. Logs: " + (data.logs || data.log || []).toString());
+      } catch (e) {
+        console.error("bulk enrich failed", e);
+        alert("Bulk enrich failed");
+      }
+    }
+
+    async function loadAndRenderCache() {
+      const all = await fetchCache();
+      const filter = document.getElementById("filterSubject").value.trim().toLowerCase();
+      const rows = filter ? all.filter(r => (r.subject || "").toLowerCase().includes(filter)) : all;
+      renderCache(rows);
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      document.getElementById("backBtn").addEventListener("click", () => { window.location.href = "/netscout"; });
+      document.getElementById("refreshCacheBtn").addEventListener("click", loadAndRenderCache);
+      document.getElementById("applyFilterBtn").addEventListener("click", loadAndRenderCache);
+      loadAndRenderCache();
+    });
+  </script>
+</body>
+</html>
