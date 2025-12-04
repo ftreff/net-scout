@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Trace Route — Net-Scout</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='netscout.css') }}" />
+
+  <style>
+    body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; background:var(--panel-bg); color:var(--panel-text); }
+    header { display:flex; align-items:center; gap:12px; padding:10px; background:var(--bg); color:var(--topbar-text); }
+    #mapWrap { height: 75vh; padding:8px; }
+    #map { height:100%; width:100%; border-radius:6px; }
+    #console { height:25vh; padding:12px; background:var(--panel-bg); color:var(--panel-text); border-top:1px solid var(--table-border); overflow:auto; font-family:monospace; font-size:13px; white-space:pre-wrap; }
+    .controls { margin-left:auto; display:flex; gap:8px; align-items:center; }
+    .btn { background:var(--btn-primary); color:#fff; border:none; padding:6px 10px; border-radius:4px; cursor:pointer; }
+    .btn.secondary { background:var(--btn-secondary); }
+    .hop-marker { font-weight:700; color:#000; text-align:center; }
+    .trace-info { font-size:13px; line-height:1.25; }
+    .muted { color:var(--muted); }
+    /* small responsive tweak */
+    @media (max-width: 900px) {
+      #mapWrap { height: 60vh; }
+      #console { height:40vh; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div style="display:flex; flex-direction:column;">
+      <strong>Trace Route</strong>
+      <span class="muted">Visual traceroute hops and CLI output</span>
+    </div>
+
+    <div class="controls">
+      <button id="returnBtn" class="btn">Return to Net-Scout</button>
+      <button id="autoZoomBtn" class="btn">Auto-zoom</button>
+      <label style="display:flex; align-items:center; gap:6px; margin-left:8px;">
+        <input id="themeToggleTrace" type="checkbox" /> <span class="muted">Light theme</span>
+      </label>
+    </div>
+  </header>
+
+  <div id="mapWrap">
+    <div id="map"></div>
+  </div>
+
+  <div id="console" aria-live="polite">Loading traceroute output...</div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <script>
+  (function () {
+    const API_TRACE = "/api/trace"; // expects ?alert_id=...
+    const params = new URLSearchParams(window.location.search);
+    const alertId = params.get("alert_id");
+
+    // Map and layers
+    let map = null;
+    let tileLight, tileDark;
+    let markersLayer;
+    let hopsPolyline = null;
+    let currentTheme = localStorage.getItem("netscout_theme") || "dark";
+
+    function initMap() {
+      map = L.map("map", { zoomControl: true }).setView([20, 0], 2);
+
+      tileLight = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", { attribution: '&copy; OpenStreetMap contributors' });
+      tileDark = L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { attribution: '&copy; OpenStreetMap contributors' });
+
+      if (currentTheme === "light") tileLight.addTo(map);
+      else tileDark.addTo(map);
+
+      markersLayer = L.layerGroup().addTo(map);
+
+      // Add auto-zoom control (top-left)
+      const AutoZoomControl = L.Control.extend({
+        options: { position: 'topleft' },
+        onAdd: function () {
+          const container = L.DomUtil.create('div', 'leaflet-bar');
+          const btn = L.DomUtil.create('a', '', container);
+          btn.href = '#';
+          btn.title = 'Auto-zoom to fit hops';
+          btn.innerHTML = '&#128269;';
+          btn.style.padding = '6px';
+          btn.style.display = 'flex';
+          btn.style.alignItems = 'center';
+          btn.style.justifyContent = 'center';
+          L.DomEvent.on(btn, 'click', L.DomEvent.stop).on(btn, 'click', (e) => {
+            fitToHops();
+          });
+          return container;
+        }
+      });
+      map.addControl(new AutoZoomControl());
+
+      // ensure map redraw after layout
+      map.whenReady(() => setTimeout(() => map.invalidateSize(), 150));
+      window.addEventListener("resize", () => setTimeout(() => map.invalidateSize(), 150));
+    }
+
+    function setTheme(theme) {
+      currentTheme = theme;
+      localStorage.setItem("netscout_theme", theme);
+      if (!map) return;
+      if (theme === "light") {
+        if (map.hasLayer(tileDark)) map.removeLayer(tileDark);
+        tileLight.addTo(map);
+      } else {
+        if (map.hasLayer(tileLight)) map.removeLayer(tileLight);
+        tileDark.addTo(map);
+      }
+    }
+
+    function fitToHops() {
+      try {
+        const layers = markersLayer.getLayers();
+        if (!layers.length) return;
+        const group = L.featureGroup(layers);
+        const bounds = group.getBounds();
+        if (bounds && bounds.isValid()) {
+          map.fitBounds(bounds.pad(0.15));
+        }
+      } catch (e) {
+        console.warn("fitToHops failed", e);
+      }
+    }
+
+    function renderConsole(text) {
+      const el = document.getElementById("console");
+      el.textContent = text || "No traceroute output available.";
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function buildHopPopup(hop) {
+      // hop: {hop, ip, rdns, lat, lon, country, state, city, output}
+      const lines = [];
+      lines.push(`<div class="trace-info"><b>Hop ${hop.hop}</b> — ${hop.ip || "n/a"}</div>`);
+      if (hop.rdns) lines.push(`<div class="trace-info"><b>Reverse DNS:</b> ${escapeHtml(hop.rdns)}</div>`);
+      if (hop.city || hop.state || hop.country) {
+        const parts = [hop.city, hop.state, hop.country].filter(Boolean).join(", ");
+        lines.push(`<div class="trace-info"><b>Location:</b> ${escapeHtml(parts)}</div>`);
+      }
+      if (hop.lat && hop.lon) lines.push(`<div class="trace-info"><b>Lat, Lon:</b> ${hop.lat}, ${hop.lon}</div>`);
+      if (hop.output) lines.push(`<pre class="ns-pre">${escapeHtml(hop.output)}</pre>`);
+      // button to re-open trace-route for this alert/hop (or to run traceroute for this hop IP)
+      lines.push(`<div style="margin-top:6px;"><button class="ns-btn" onclick="window.open('/trace_route?alert_id=${encodeURIComponent(alertId)}&focus_ip=${encodeURIComponent(hop.ip)}','_self')">Focus</button></div>`);
+      return lines.join("");
+    }
+
+    function escapeHtml(s) {
+      if (s === null || s === undefined) return "";
+      return String(s).replace(/[&<>"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]; });
+    }
+
+    function plotHops(hops) {
+      markersLayer.clearLayers();
+      if (hopsPolyline) {
+        try { map.removeLayer(hopsPolyline); } catch (e) {}
+        hopsPolyline = null;
+      }
+
+      const latlngs = [];
+      hops.forEach(h => {
+        if (h.lat && h.lon) {
+          latlngs.push([Number(h.lat), Number(h.lon)]);
+          const marker = L.circleMarker([Number(h.lat), Number(h.lon)], {
+            radius: 8,
+            fillColor: "#2b9cff",
+            color: "#000",
+            weight: 1,
+            opacity: 1,
+            fillOpacity: 0.9
+          });
+          const popupHtml = buildHopPopup(h);
+          marker.bindPopup(popupHtml, { maxWidth: 420 });
+          marker.addTo(markersLayer);
+          // add a label with hop number
+          const label = L.divIcon({ className: 'hop-marker', html: `<div style="background:rgba(255,255,255,0.9);padding:2px 6px;border-radius:4px;">${h.hop}</div>` });
+          L.marker([Number(h.lat), Number(h.lon)], { icon: label, interactive: false }).addTo(markersLayer);
+        }
+      });
+
+      if (latlngs.length >= 2) {
+        hopsPolyline = L.polyline(latlngs, { color: '#ff7f50', weight: 3, opacity: 0.9 }).addTo(map);
+      }
+
+      // auto-zoom to hops
+      setTimeout(() => fitToHops(), 200);
+    }
+
+    async function fetchTrace(alert_id) {
+      try {
+        const url = `${API_TRACE}?alert_id=${encodeURIComponent(alert_id)}`;
+        const res = await fetch(url);
+        if (!res.ok) {
+          const txt = await res.text();
+          renderConsole(`Failed to fetch traceroute: ${res.status} ${res.statusText}\n${txt}`);
+          return null;
+        }
+        const data = await res.json();
+        // expected shape: { hops: [...], raw_output: "..." }
+        return data;
+      } catch (e) {
+        console.error("fetchTrace error", e);
+        renderConsole("Error fetching traceroute data.");
+        return null;
+      }
+    }
+
+    // Wire UI
+    document.getElementById("returnBtn").addEventListener("click", () => {
+      window.location.href = "/netscout";
+    });
+    document.getElementById("autoZoomBtn").addEventListener("click", () => fitToHops());
+    document.getElementById("themeToggleTrace").addEventListener("change", (ev) => {
+      setTheme(ev.target.checked ? "light" : "dark");
+    });
+
+    // Initialize
+    initMap();
+    setTheme(currentTheme);
+    (async function main() {
+      if (!alertId) {
+        renderConsole("No alert_id provided. Open this page with ?alert_id=<id>.");
+        return;
+      }
+      renderConsole("Loading traceroute data...");
+      const data = await fetchTrace(alertId);
+      if (!data) return;
+      // data.hops: array of {hop, ip, rdns, lat, lon, country, state, city, output}
+      const hops = data.hops || [];
+      const raw = data.raw_output || data.raw || "";
+      renderConsole(raw || "No traceroute output available.");
+      plotHops(hops);
+    })();
+  })();
+  </script>
+</body>
+</html>
