@@ -1,0 +1,94 @@
+/* netscout.css - minimal theme styles for Net-Scout */
+
+/* Default (dark) */
+:root {
+  --bg: #0b3d91;
+  --topbar-text: #ffffff;
+  --panel-bg: #0f1724;
+  --panel-text: #e6eef8;
+  --muted: rgba(255,255,255,0.75);
+  --table-border: rgba(255,255,255,0.06);
+}
+
+/* Light theme overrides */
+[data-theme="light"] {
+  --bg: #f8f9fa;
+  --topbar-text: #111;
+  --panel-bg: #ffffff;
+  --panel-text: #111;
+  --muted: rgba(0,0,0,0.6);
+  --table-border: rgba(0,0,0,0.08);
+}
+
+/* Topbar */
+#topbar {
+  background: var(--bg);
+  color: var(--topbar-text);
+  padding: 10px;
+  display: flex;
+  align-items: center;
+}
+
+/* Map container */
+#map {
+  background: #111;
+}
+
+/* Alerts panel */
+#alerts {
+  background: var(--panel-bg);
+  color: var(--panel-text);
+  padding: 10px;
+  border-top: 1px solid var(--table-border);
+}
+
+/* Table */
+#alertsTable thead th {
+  color: var(--panel-text);
+  border-bottom: 1px solid var(--table-border);
+}
+#alertsTable tbody td {
+  padding: 6px;
+  color: var(--panel-text);
+  border-bottom: 1px solid var(--table-border);
+}
+
+/* Buttons */
+.btn {
+  background: #1e90ff;
+  color: #fff;
+  border: none;
+  padding: 6px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.btn.secondary {
+  background: #6c757d;
+}
+
+/* Small */
+.small {
+  font-size: 0.9rem;
+  padding: 4px 8px;
+}
+
+/* Popup styling (Leaflet) */
+.leaflet-popup-content pre {
+  background: rgba(0,0,0,0.05);
+  padding: 6px;
+  border-radius: 4px;
+  margin: 6px 0;
+  color: var(--panel-text);
+}
+
+/* Ensure theme toggles look OK */
+.theme-toggle button {
+  background: transparent;
+  border: 1px solid rgba(255,255,255,0.08);
+  color: inherit;
+  border-radius: 4px;
+  padding: 6px 8px;
+}
+[data-theme="light"] .theme-toggle button {
+  border: 1px solid rgba(0,0,0,0.08);
+}
