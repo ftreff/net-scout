@@ -1,4 +1,4 @@
-// netscout.js - client logic for Net-Scout UI (auto-zoom, refresh controls, exclude private srcs)
+// netscout.js - patched: fixes auto-zoom, popup styling, rdns display, Trace Route button
 
 const API_BASE = "/api";
 let map, markersLayer;
@@ -7,8 +7,8 @@ const DARK_TILE = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png
 const LIGHT_TILE = "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png";
 const ATTRIB = '&copy; <a href="https://carto.com/">CartoDB</a> &copy; OpenStreetMap contributors';
 
-let ALERTS_POLL_INTERVAL = 60000; // default 60s
-let STATUS_POLL_INTERVAL = 10000; // 10s
+let ALERTS_POLL_INTERVAL = 60000;
+let STATUS_POLL_INTERVAL = 10000;
 let alertsPollTimer = null;
 let statusPollTimer = null;
 let invalidateTimer = null;
@@ -47,7 +47,7 @@ function initMap() {
 
   markersLayer = L.layerGroup().addTo(map);
 
-  // Add auto-zoom control (top-left, near zoom controls)
+  // Add auto-zoom control (top-left)
   const AutoZoomControl = L.Control.extend({
     options: { position: 'topleft' },
     onAdd: function () {
@@ -55,7 +55,7 @@ function initMap() {
       const btn = L.DomUtil.create('a', 'autozoom', container);
       btn.href = '#';
       btn.title = 'Auto-zoom to fit markers';
-      btn.innerHTML = '&#128269;'; // magnifying glass icon
+      btn.innerHTML = '&#128269;';
       btn.style.padding = '6px';
       btn.style.display = 'flex';
       btn.style.alignItems = 'center';
@@ -98,32 +98,54 @@ function switchToTheme(theme) {
 }
 
 function buildPopupHtml(a) {
+  // Show rdns fields if present in enrichment; otherwise show "n/a"
   const evidence = a.evidence || {};
   const enrich = a.enrichment || {};
-  let html = `<div style="min-width:260px;">`;
-  html += `<b>Alert ID:</b> ${a.id}<br>`;
-  html += `<b>Type:</b> ${a.alert_type}<br>`;
-  html += `<b>Score:</b> ${a.score}<br>`;
-  html += `<b>Src:</b> ${a.src_ip || "N/A"}<br>`;
-  html += `<b>Dst:</b> ${a.dst_ip || "N/A"}<br>`;
-  html += `<b>When:</b> ${a.created_at || "N/A"}<br>`;
-  html += `<b>Status:</b> ${a.status || "N/A"}<br>`;
-  html += `<hr>`;
-  html += `<b>Evidence:</b><pre style="white-space:pre-wrap;max-height:120px;overflow:auto;">${JSON.stringify(evidence, null, 2)}</pre>`;
-  if (Object.keys(enrich).length) {
-    html += `<hr><b>Enrichment:</b><pre style="white-space:pre-wrap;max-height:160px;overflow:auto;">${JSON.stringify(enrich, null, 2)}</pre>`;
-  } else {
-    html += `<div style="opacity:0.8; margin-top:6px;">No enrichment yet</div>`;
-  }
+  const src_rdns = enrich.src_rdns || enrich.src_rdns_name || enrich.src_rdns_name || enrich.src_rdns || (enrich.src_rdns === 0 ? "0" : null);
+  const dst_rdns = enrich.dst_rdns || enrich.dst_rdns_name || enrich.dst_rdns || null;
+
+  const src_rdns_display = src_rdns ? String(src_rdns) : "n/a";
+  const dst_rdns_display = dst_rdns ? String(dst_rdns) : "n/a";
+
+  // Build HTML with readable colors (popup CSS will style background and pre)
+  let html = `<div class="ns-popup">`;
+  html += `<div style="font-weight:700;margin-bottom:6px;">Alert ID: ${a.id}</div>`;
+  html += `<div><b>Type:</b> ${a.alert_type || "N/A"}</div>`;
+  html += `<div><b>Score:</b> ${a.score || 0}</div>`;
+  html += `<div><b>Src:</b> ${a.src_ip || "N/A"}</div>`;
+  html += `<div style="margin-left:6px;color:var(--muted);"><b>Src DNS:</b> ${escapeHtml(src_rdns_display)}</div>`;
+  html += `<div><b>Dst:</b> ${a.dst_ip || "N/A"}</div>`;
+  html += `<div style="margin-left:6px;color:var(--muted);"><b>Dst DNS:</b> ${escapeHtml(dst_rdns_display)}</div>`;
+  html += `<div><b>When:</b> ${a.created_at || "N/A"}</div>`;
+  html += `<div><b>Status:</b> ${a.status || "N/A"}</div>`;
+  html += `<hr style="margin:8px 0;">`;
+  html += `<div style="font-weight:600;color:var(--panel-text);">Evidence:</div>`;
+  html += `<pre class="ns-pre">${escapeHtml(JSON.stringify(evidence, null, 2))}</pre>`;
+  html += `<div style="font-weight:600;color:var(--panel-text); margin-top:6px;">Enrichment:</div>`;
+  html += `<pre class="ns-pre">${escapeHtml(JSON.stringify(enrich, null, 2))}</pre>`;
+  html += `<div style="display:flex; gap:8px; margin-top:8px;">`;
+  // Trace Route button opens new page with alert_id param
+  html += `<button class="ns-btn" onclick="window.open('/trace_route?alert_id=${encodeURIComponent(a.id)}','_blank')">Trace Route</button>`;
+  html += `<button class="ns-btn secondary" onclick="window.open('/enrichment_cache','_blank')">Enrichment Cache</button>`;
+  html += `</div>`;
   html += `</div>`;
   return html;
+}
+
+function escapeHtml(s) {
+  if (s === null || s === undefined) return "";
+  return String(s).replace(/[&<>"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]; });
 }
 
 function fitToMarkers() {
   try {
     if (!markersLayer) return;
-    const bounds = markersLayer.getBounds ? markersLayer.getBounds() : null;
-    if (bounds && bounds.isValid && bounds.isValid()) {
+    // Build bounds from all marker layers
+    const layers = markersLayer.getLayers ? markersLayer.getLayers() : [];
+    if (!layers.length) return;
+    const group = L.featureGroup(layers);
+    const bounds = group.getBounds();
+    if (bounds && bounds.isValid()) {
       map.fitBounds(bounds.pad(0.15));
     }
   } catch (e) {
@@ -156,7 +178,6 @@ async function loadAlerts() {
     const data = await res.json();
     let alerts = data.alerts || [];
 
-    // Client-side filter: exclude src IPs that start with 192.168.
     if (excludePrivate) {
       alerts = alerts.filter(a => {
         const s = (a.src_ip || "").trim();
@@ -211,12 +232,13 @@ function renderAlerts(alerts) {
         opacity: 1,
         fillOpacity: 0.8
       });
-      marker.bindPopup(buildPopupHtml(a));
+      // Use a sanitized popup and ensure popup content uses CSS classes defined in netscout.css
+      marker.bindPopup(buildPopupHtml(a), { maxWidth: 420 });
       markersLayer.addLayer(marker);
     }
   });
 
-  // Force Leaflet to recalculate size and keep map visible
+  // After markers added, ensure map redraw and keep map visible
   safeInvalidate();
 }
 
