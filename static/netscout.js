@@ -1,6 +1,6 @@
-// netscout.js - client logic for Net-Scout UI (patched)
-// Added guards to ensure map and markersLayer exist and call map.invalidateSize()
-// after rendering alerts or when layout changes so the Leaflet map doesn't disappear.
+// netscout.js - client logic for Net-Scout UI (patched for map invalidate + dropdown readability)
+// Ensures map.invalidateSize() runs after layout changes and when logs/filters change.
+// Debounced invalidate to avoid thrashing.
 
 const API_BASE = "/api";
 let map, markersLayer;
@@ -13,6 +13,7 @@ let ALERTS_POLL_INTERVAL = 60000; // 60s
 let STATUS_POLL_INTERVAL = 10000; // 10s
 let alertsPollTimer = null;
 let statusPollTimer = null;
+let invalidateTimer = null;
 
 function getSavedTheme() {
   return localStorage.getItem("netscout_theme") || "dark";
@@ -56,15 +57,23 @@ function initMap() {
 
   // Ensure map redraw after initial layout
   map.whenReady(() => {
-    setTimeout(() => {
-      try { map.invalidateSize(); } catch (e) { /* ignore */ }
-    }, 150);
+    setTimeout(() => safeInvalidate(), 150);
   });
 
   // Recalculate on window resize
-  window.addEventListener("resize", () => {
-    try { if (map && typeof map.invalidateSize === "function") map.invalidateSize(); } catch (e) {}
-  });
+  window.addEventListener("resize", () => safeInvalidate());
+}
+
+function safeInvalidate() {
+  // Debounced invalidate to avoid thrash
+  if (invalidateTimer) clearTimeout(invalidateTimer);
+  invalidateTimer = setTimeout(() => {
+    try {
+      if (map && typeof map.invalidateSize === "function") map.invalidateSize();
+    } catch (e) {
+      console.warn("map.invalidateSize() failed", e);
+    }
+  }, 150);
 }
 
 function switchToTheme(theme) {
@@ -78,6 +87,7 @@ function switchToTheme(theme) {
     darkLayer.addTo(map);
   }
   applyTopbarTheme(theme);
+  safeInvalidate();
 }
 
 function buildPopupHtml(a) {
@@ -178,15 +188,7 @@ function renderAlerts(alerts) {
   });
 
   // Force Leaflet to recalculate size after DOM updates so the map remains visible
-  setTimeout(() => {
-    try {
-      if (map && typeof map.invalidateSize === "function") {
-        map.invalidateSize();
-      }
-    } catch (e) {
-      console.warn("map.invalidateSize() failed", e);
-    }
-  }, 200);
+  safeInvalidate();
 }
 
 async function runScan(enrich = false, dry_run = false) {
@@ -314,7 +316,6 @@ function updateStatusUI(data) {
   const enrichLabel = document.getElementById("enrichStatusLabel");
   const lastEnrich = document.getElementById("lastEnrichTime");
 
-  // Use numeric percent if available; otherwise fallback to heuristics
   const scanPercent = Number(scan.percent || 0);
   try { if (scanFill) scanFill.style.width = `${scanPercent}%`; } catch (e) {}
   if (tasks.scan_running) {
@@ -357,6 +358,15 @@ function wireUi() {
 
   document.getElementById("themeDarkBtn").addEventListener("click", () => switchToTheme("dark"));
   document.getElementById("themeLightBtn").addEventListener("click", () => switchToTheme("light"));
+
+  // When log dropdown changes, refresh tail and ensure map redraw
+  const logSelect = document.getElementById("logSelect");
+  if (logSelect) {
+    logSelect.addEventListener("change", () => {
+      // refresh log tail is handled in template script; just ensure map redraw
+      safeInvalidate();
+    });
+  }
 }
 
 function startPolling() {
