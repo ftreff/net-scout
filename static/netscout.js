@@ -63,7 +63,6 @@ function switchToTheme(theme) {
   applyTopbarTheme(theme);
 }
 
-// Build popup HTML for an alert
 function buildPopupHtml(a) {
   const evidence = a.evidence || {};
   const enrich = a.enrichment || {};
@@ -86,7 +85,6 @@ function buildPopupHtml(a) {
   return html;
 }
 
-// Fetch alerts with filters and render table + markers
 async function loadAlerts() {
   const since = document.getElementById("sinceSelect").value;
   const type = document.getElementById("filterType").value;
@@ -159,7 +157,6 @@ function renderAlerts(alerts) {
   });
 }
 
-// Run scan via API
 async function runScan(enrich = false, dry_run = false) {
   const since = document.getElementById("sinceSelect").value;
   const body = { since, enrich, dry_run };
@@ -177,7 +174,6 @@ async function runScan(enrich = false, dry_run = false) {
   }
 }
 
-// Enrich single alert
 async function enrichAlert(alert_id) {
   try {
     const res = await fetch(`${API_BASE}/enrich_alert`, {
@@ -193,7 +189,6 @@ async function enrichAlert(alert_id) {
   }
 }
 
-// Bulk enrich newest N alerts
 async function bulkEnrichNewest(n) {
   try {
     const res = await fetch(`${API_BASE}/enrich_bulk`, {
@@ -209,7 +204,6 @@ async function bulkEnrichNewest(n) {
   }
 }
 
-// Snooze alert (simple implementation: set status to snoozed)
 async function snoozeAlert(alert_id) {
   const duration = prompt("Snooze duration in minutes (default 60):", "60");
   if (duration === null) return;
@@ -232,7 +226,6 @@ async function snoozeAlert(alert_id) {
   }
 }
 
-// Mark false positive
 async function markFalsePositive(alert_id) {
   if (!confirm("Mark alert " + alert_id + " as false positive?")) return;
   try {
@@ -254,7 +247,6 @@ async function markFalsePositive(alert_id) {
   }
 }
 
-// Poll status endpoint and update UI
 async function pollStatus() {
   try {
     const res = await fetch(`${API_BASE}/status`);
@@ -279,7 +271,6 @@ function formatSeconds(s) {
 }
 
 function updateStatusUI(data) {
-  // Scan progress
   const scan = data.scan_progress || {};
   const enrich = data.enrich_progress || {};
   const tasks = data.tasks || {};
@@ -291,30 +282,28 @@ function updateStatusUI(data) {
   const enrichLabel = document.getElementById("enrichStatusLabel");
   const lastEnrich = document.getElementById("lastEnrichTime");
 
-  if (scanFill) scanFill.style.width = (scan.percent || 0) + "%";
-  if (scanLabel) {
-    if (tasks.tasks && tasks.tasks.scan_running) {
-      scanLabel.textContent = `Running (${scan.processed || 0}/${scan.total_candidates || "?"})`;
-    } else if (scan.finished) {
-      scanLabel.textContent = "Complete";
-    } else {
-      scanLabel.textContent = (scan.percent || 0) + "%";
-    }
+  // Use numeric percent if available; otherwise fallback to heuristics
+  const scanPercent = Number(scan.percent || 0);
+  scanFill.style.width = `${scanPercent}%`;
+  if (tasks.scan_running) {
+    scanLabel.textContent = `Running (${scan.processed || 0}/${scan.total_candidates || "?"})`;
+  } else if (scan.finished) {
+    scanLabel.textContent = "Complete";
+  } else {
+    scanLabel.textContent = `${scanPercent}%`;
   }
-  if (lastScan) lastScan.textContent = data.last_scan_log || "never";
+  lastScan.textContent = data.last_scan_log || "never";
 
-  if (enrichFill) enrichFill.style.width = (enrich.percent || 0) + "%";
-  if (enrichLabel) {
-    if (tasks.enrich_running) {
-      enrichLabel.textContent = `Running (${enrich.total_processed || 0}/${enrich.total_started || "?"})`;
-    } else {
-      enrichLabel.textContent = (enrich.percent || 0) + "%";
-    }
+  const enrichPercent = Number(enrich.percent || 0);
+  enrichFill.style.width = `${enrichPercent}%`;
+  if (tasks.enrich_running) {
+    enrichLabel.textContent = `Running (${enrich.total_processed || 0}/${enrich.total_started || "?"})`;
+  } else {
+    enrichLabel.textContent = `${enrichPercent}%`;
   }
-  if (lastEnrich) lastEnrich.textContent = data.last_enrich_log || "never";
+  lastEnrich.textContent = data.last_enrich_log || "never";
 }
 
-// Wire UI controls
 function wireUi() {
   document.getElementById("runScanBtn").addEventListener("click", () => runScan(false, false));
   document.getElementById("runScanEnrichBtn").addEventListener("click", () => runScan(true, false));
@@ -334,23 +323,19 @@ function wireUi() {
     bulkEnrichNewest(n);
   });
 
-  // Theme buttons
   document.getElementById("themeDarkBtn").addEventListener("click", () => switchToTheme("dark"));
   document.getElementById("themeLightBtn").addEventListener("click", () => switchToTheme("light"));
 }
 
-// Start polling loops
 function startPolling() {
   if (alertsPollTimer) clearInterval(alertsPollTimer);
   if (statusPollTimer) clearInterval(statusPollTimer);
-  // initial immediate loads
   loadAlerts();
   pollStatus();
   alertsPollTimer = setInterval(loadAlerts, ALERTS_POLL_INTERVAL);
   statusPollTimer = setInterval(pollStatus, STATUS_POLL_INTERVAL);
 }
 
-// Initialize on load
 window.addEventListener("load", () => {
   initMap();
   wireUi();
