@@ -1,6 +1,4 @@
-// netscout.js - client logic for Net-Scout UI (patched for map invalidate + dropdown readability)
-// Ensures map.invalidateSize() runs after layout changes and when logs/filters change.
-// Debounced invalidate to avoid thrashing.
+// netscout.js - client logic for Net-Scout UI (auto-zoom, refresh controls, exclude private srcs)
 
 const API_BASE = "/api";
 let map, markersLayer;
@@ -9,15 +7,13 @@ const DARK_TILE = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png
 const LIGHT_TILE = "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png";
 const ATTRIB = '&copy; <a href="https://carto.com/">CartoDB</a> &copy; OpenStreetMap contributors';
 
-let ALERTS_POLL_INTERVAL = 60000; // 60s
+let ALERTS_POLL_INTERVAL = 60000; // default 60s
 let STATUS_POLL_INTERVAL = 10000; // 10s
 let alertsPollTimer = null;
 let statusPollTimer = null;
 let invalidateTimer = null;
 
-function getSavedTheme() {
-  return localStorage.getItem("netscout_theme") || "dark";
-}
+function getSavedTheme() { return localStorage.getItem("netscout_theme") || "dark"; }
 function setSavedTheme(t) { localStorage.setItem("netscout_theme", t); }
 
 function applyTopbarTheme(theme) {
@@ -51,28 +47,39 @@ function initMap() {
 
   markersLayer = L.layerGroup().addTo(map);
 
+  // Add auto-zoom control (top-left, near zoom controls)
+  const AutoZoomControl = L.Control.extend({
+    options: { position: 'topleft' },
+    onAdd: function () {
+      const container = L.DomUtil.create('div', 'leaflet-bar');
+      const btn = L.DomUtil.create('a', 'autozoom', container);
+      btn.href = '#';
+      btn.title = 'Auto-zoom to fit markers';
+      btn.innerHTML = '&#128269;'; // magnifying glass icon
+      btn.style.padding = '6px';
+      btn.style.display = 'flex';
+      btn.style.alignItems = 'center';
+      btn.style.justifyContent = 'center';
+      L.DomEvent.on(btn, 'click', L.DomEvent.stop).on(btn, 'click', (e) => {
+        fitToMarkers();
+      });
+      return container;
+    }
+  });
+  map.addControl(new AutoZoomControl());
+
   document.getElementById("themeDarkBtn").addEventListener("click", () => switchToTheme("dark"));
   document.getElementById("themeLightBtn").addEventListener("click", () => switchToTheme("light"));
   applyTopbarTheme(theme);
 
-  // Ensure map redraw after initial layout
-  map.whenReady(() => {
-    setTimeout(() => safeInvalidate(), 150);
-  });
-
-  // Recalculate on window resize
+  map.whenReady(() => { setTimeout(() => safeInvalidate(), 150); });
   window.addEventListener("resize", () => safeInvalidate());
 }
 
 function safeInvalidate() {
-  // Debounced invalidate to avoid thrash
   if (invalidateTimer) clearTimeout(invalidateTimer);
   invalidateTimer = setTimeout(() => {
-    try {
-      if (map && typeof map.invalidateSize === "function") map.invalidateSize();
-    } catch (e) {
-      console.warn("map.invalidateSize() failed", e);
-    }
+    try { if (map && typeof map.invalidateSize === "function") map.invalidateSize(); } catch (e) { console.warn(e); }
   }, 150);
 }
 
@@ -112,6 +119,18 @@ function buildPopupHtml(a) {
   return html;
 }
 
+function fitToMarkers() {
+  try {
+    if (!markersLayer) return;
+    const bounds = markersLayer.getBounds ? markersLayer.getBounds() : null;
+    if (bounds && bounds.isValid && bounds.isValid()) {
+      map.fitBounds(bounds.pad(0.15));
+    }
+  } catch (e) {
+    console.warn("fitToMarkers failed", e);
+  }
+}
+
 async function loadAlerts() {
   ensureMap();
 
@@ -121,6 +140,7 @@ async function loadAlerts() {
   const dst = document.getElementById("filterDst").value.trim();
   const minScore = document.getElementById("minScore").value || 0;
   const limit = 500;
+  const excludePrivate = document.getElementById("excludePrivate") && document.getElementById("excludePrivate").checked;
 
   const params = new URLSearchParams();
   if (since) params.set("since", since);
@@ -134,7 +154,16 @@ async function loadAlerts() {
   try {
     const res = await fetch(url);
     const data = await res.json();
-    const alerts = data.alerts || [];
+    let alerts = data.alerts || [];
+
+    // Client-side filter: exclude src IPs that start with 192.168.
+    if (excludePrivate) {
+      alerts = alerts.filter(a => {
+        const s = (a.src_ip || "").trim();
+        return !(s.startsWith("192.168."));
+      });
+    }
+
     renderAlerts(alerts);
   } catch (err) {
     console.error("Failed to load alerts", err);
@@ -187,7 +216,7 @@ function renderAlerts(alerts) {
     }
   });
 
-  // Force Leaflet to recalculate size after DOM updates so the map remains visible
+  // Force Leaflet to recalculate size and keep map visible
   safeInvalidate();
 }
 
@@ -291,19 +320,6 @@ async function pollStatus() {
   }
 }
 
-function formatSeconds(s) {
-  if (s == null) return "n/a";
-  s = Number(s);
-  if (isNaN(s)) return "n/a";
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  if (m < 60) return `${m}m ${sec}s`;
-  const h = Math.floor(m / 60);
-  const mm = m % 60;
-  return `${h}h ${mm}m`;
-}
-
 function updateStatusUI(data) {
   const scan = data.scan_progress || {};
   const enrich = data.enrich_progress || {};
@@ -348,6 +364,7 @@ function wireUi() {
     document.getElementById("filterSrc").value = "";
     document.getElementById("filterDst").value = "";
     document.getElementById("minScore").value = 0;
+    document.getElementById("excludePrivate").checked = false;
     loadAlerts();
   });
   document.getElementById("bulkEnrichBtn").addEventListener("click", () => {
@@ -359,14 +376,26 @@ function wireUi() {
   document.getElementById("themeDarkBtn").addEventListener("click", () => switchToTheme("dark"));
   document.getElementById("themeLightBtn").addEventListener("click", () => switchToTheme("light"));
 
-  // When log dropdown changes, refresh tail and ensure map redraw
-  const logSelect = document.getElementById("logSelect");
-  if (logSelect) {
-    logSelect.addEventListener("change", () => {
-      // refresh log tail is handled in template script; just ensure map redraw
-      safeInvalidate();
-    });
+  // Auto-refresh controls
+  const autoEnabled = document.getElementById("autoRefreshEnabled");
+  const refreshSelect = document.getElementById("refreshInterval");
+  const autoStatus = document.getElementById("autoRefreshStatus");
+
+  function applyRefreshSettings() {
+    const enabled = autoEnabled.checked;
+    const interval = Number(refreshSelect.value || 60) * 1000;
+    ALERTS_POLL_INTERVAL = interval;
+    autoStatus.textContent = enabled ? `on (${interval/1000}s)` : 'off';
+    if (alertsPollTimer) clearInterval(alertsPollTimer);
+    if (enabled) alertsPollTimer = setInterval(loadAlerts, ALERTS_POLL_INTERVAL);
   }
+
+  autoEnabled.addEventListener("change", applyRefreshSettings);
+  refreshSelect.addEventListener("change", applyRefreshSettings);
+
+  // When log dropdown changes, ensure map redraw
+  const logSelect = document.getElementById("logSelect");
+  if (logSelect) logSelect.addEventListener("change", () => safeInvalidate());
 }
 
 function startPolling() {
@@ -374,8 +403,14 @@ function startPolling() {
   if (statusPollTimer) clearInterval(statusPollTimer);
   loadAlerts();
   pollStatus();
-  alertsPollTimer = setInterval(loadAlerts, ALERTS_POLL_INTERVAL);
   statusPollTimer = setInterval(pollStatus, STATUS_POLL_INTERVAL);
+  const enabled = document.getElementById("autoRefreshEnabled") ? document.getElementById("autoRefreshEnabled").checked : true;
+  const interval = Number(document.getElementById("refreshInterval") ? document.getElementById("refreshInterval").value : 60) * 1000;
+  ALERTS_POLL_INTERVAL = interval;
+  if (alertsPollTimer) clearInterval(alertsPollTimer);
+  if (enabled) alertsPollTimer = setInterval(loadAlerts, ALERTS_POLL_INTERVAL);
+  const autoStatus = document.getElementById("autoRefreshStatus");
+  if (autoStatus) autoStatus.textContent = enabled ? `on (${interval/1000}s)` : 'off';
 }
 
 window.addEventListener("load", () => {
