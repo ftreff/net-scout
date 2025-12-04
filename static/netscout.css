@@ -148,8 +148,22 @@ input[type="number"] {
   outline: none;
 }
 
+/* Ensure the "Window" dropdown uses theme colors and is readable */
+#sinceSelect,
+#sinceSelect option {
+  background: var(--select-bg) !important;
+  color: var(--select-text) !important;
+  border: 1px solid var(--select-border) !important;
+  padding: 6px;
+  border-radius: 4px;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+}
+
 /* Ensure dropdown arrow is visible on dark backgrounds in some browsers */
 select::-ms-expand { color: var(--select-text); }
+#sinceSelect::-ms-expand { color: var(--select-text) !important; }
 
 /* Popup styling (Leaflet) */
 .leaflet-popup-content pre {
