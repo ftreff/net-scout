@@ -20,6 +20,7 @@
     .hop-marker { font-weight:700; color:#000; text-align:center; }
     .trace-info { font-size:13px; line-height:1.25; }
     .muted { color:var(--muted); }
+    .ns-pre { background: var(--popup-pre-bg); color: var(--popup-text); padding:6px; border-radius:4px; white-space:pre-wrap; font-family:monospace; font-size:12px; }
     /* small responsive tweak */
     @media (max-width: 900px) {
       #mapWrap { height: 60vh; }
@@ -54,8 +55,10 @@
   <script>
   (function () {
     const API_TRACE = "/api/trace"; // expects ?alert_id=...
+    const API_TRACE_RUN = "/api/trace_run"; // POST { alert_id } or { target }
     const params = new URLSearchParams(window.location.search);
     const alertId = params.get("alert_id");
+    const focusIp = params.get("focus_ip") || null;
 
     // Map and layers
     let map = null;
@@ -63,6 +66,7 @@
     let markersLayer;
     let hopsPolyline = null;
     let currentTheme = localStorage.getItem("netscout_theme") || "dark";
+    let autoRerunAttempted = false;
 
     function initMap() {
       map = L.map("map", { zoomControl: true }).setView([20, 0], 2);
@@ -134,6 +138,29 @@
       el.scrollTop = el.scrollHeight;
     }
 
+    function renderConsoleFormatted(hops, raw) {
+      const el = document.getElementById("console");
+      if (!hops || !hops.length) {
+        el.textContent = raw || "No traceroute output available.";
+        el.scrollTop = el.scrollHeight;
+        return;
+      }
+      const lines = [];
+      hops.forEach(h => {
+        const hop = h.hop || "?";
+        const ip = h.ip || "*";
+        const rdns = h.rdns || "";
+        const times = (h.times && h.times.length) ? h.times.map(t => `${t} ms`).join("  ") : (h.output && h.output.includes("*") ? "* * *" : "");
+        const geo = (h.country || h.state || h.city) ? ` (${[h.country, h.state, h.city].filter(Boolean).join(", ")})` : "";
+        const rdnsPart = rdns ? `${rdns} ` : "";
+        const ipPart = ip !== "*" ? `[${ip}]` : ip;
+        const line = `Hop ${hop}: ${ipPart} ${rdnsPart}${geo}  ${times}`;
+        lines.push(line);
+      });
+      el.textContent = lines.join("\n");
+      el.scrollTop = el.scrollHeight;
+    }
+
     function buildHopPopup(hop) {
       // hop: {hop, ip, rdns, lat, lon, country, state, city, output}
       const lines = [];
@@ -145,8 +172,8 @@
       }
       if (hop.lat && hop.lon) lines.push(`<div class="trace-info"><b>Lat, Lon:</b> ${hop.lat}, ${hop.lon}</div>`);
       if (hop.output) lines.push(`<pre class="ns-pre">${escapeHtml(hop.output)}</pre>`);
-      // button to re-open trace-route for this alert/hop (or to run traceroute for this hop IP)
-      lines.push(`<div style="margin-top:6px;"><button class="ns-btn" onclick="window.open('/trace_route?alert_id=${encodeURIComponent(alertId)}&focus_ip=${encodeURIComponent(hop.ip)}','_self')">Focus</button></div>`);
+      // button to focus this hop (reopen same page with focus_ip)
+      lines.push(`<div style="margin-top:6px;"><button class="ns-btn" onclick="window.location.href='/trace_route?alert_id=${encodeURIComponent(alertId)}&focus_ip=${encodeURIComponent(hop.ip)}'">Focus</button></div>`);
       return lines.join("");
     }
 
@@ -163,7 +190,9 @@
       }
 
       const latlngs = [];
-      hops.forEach(h => {
+      // sort by hop number to ensure correct polyline order
+      const sorted = (hops || []).slice().sort((a,b) => (a.hop||0) - (b.hop||0));
+      sorted.forEach(h => {
         if (h.lat && h.lon) {
           latlngs.push([Number(h.lat), Number(h.lon)]);
           const marker = L.circleMarker([Number(h.lat), Number(h.lon)], {
@@ -210,6 +239,37 @@
       }
     }
 
+    async function runTraceOnServer(opts = {}) {
+      // opts: { alert_id } or { target }
+      try {
+        const res = await fetch(API_TRACE_RUN, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(opts)
+        });
+        if (!res.ok) {
+          const txt = await res.text();
+          renderConsole(`Trace run failed: ${res.status} ${res.statusText}\n${txt}`);
+          return null;
+        }
+        const data = await res.json();
+        return data;
+      } catch (e) {
+        console.error("runTraceOnServer error", e);
+        renderConsole("Error running traceroute on server.");
+        return null;
+      }
+    }
+
+    function hopsHaveMissing(hops) {
+      if (!hops || !hops.length) return false;
+      for (const h of hops) {
+        if (!h.ip) return true;
+        if (h.output && h.output.includes("*")) return true;
+      }
+      return false;
+    }
+
     // Wire UI
     document.getElementById("returnBtn").addEventListener("click", () => {
       window.location.href = "/netscout";
@@ -222,20 +282,64 @@
     // Initialize
     initMap();
     setTheme(currentTheme);
+
+    // --- Replaced main() IIFE: loads stored hops, optionally auto-runs once, chooses richer result, then plots ---
     (async function main() {
       if (!alertId) {
         renderConsole("No alert_id provided. Open this page with ?alert_id=<id>.");
         return;
       }
-      renderConsole("Loading traceroute data...");
-      const data = await fetchTrace(alertId);
-      if (!data) return;
-      // data.hops: array of {hop, ip, rdns, lat, lon, country, state, city, output}
-      const hops = data.hops || [];
-      const raw = data.raw_output || data.raw || "";
-      renderConsole(raw || "No traceroute output available.");
-      plotHops(hops);
+
+      // 1) load stored trace (if any)
+      renderConsole("Loading stored traceroute data...");
+      const stored = await fetchTrace(alertId);
+      if (!stored) return;
+      const storedHops = stored.hops || [];
+      const raw = stored.raw_output || stored.raw || "";
+      renderConsoleFormatted(storedHops, raw);
+      plotHops(storedHops);
+
+      // 2) if missing hops, automatically try one re-run (only once)
+      if (hopsHaveMissing(storedHops) && !autoRerunAttempted) {
+        autoRerunAttempted = true;
+        renderConsole("Missing hops detected — attempting one automatic re-run...");
+        const runRes = await runTraceOnServer({ alert_id: alertId });
+        if (runRes && runRes.hops) {
+          const runHops = runRes.hops;
+          // choose the result that has more resolved IPs
+          const countResolved = arr => (arr || []).filter(h => h.ip).length;
+          const storedCount = countResolved(storedHops);
+          const runCount = countResolved(runHops);
+          const chosen = runCount >= storedCount ? runHops : storedHops;
+          renderConsoleFormatted(chosen, runRes.raw_output || raw);
+          plotHops(chosen);
+        } else {
+          // fallback to stored
+          renderConsoleFormatted(storedHops, raw);
+          plotHops(storedHops);
+        }
+      }
+
+      // If focus_ip provided, try to open popup for that hop after plotting
+      if (focusIp) {
+        setTimeout(() => {
+          markersLayer.eachLayer(layer => {
+            try {
+              if (layer && layer.getLatLng && layer.getPopup) {
+                const popup = layer.getPopup();
+                if (!popup) return;
+                const content = popup.getContent();
+                if (content && content.includes(focusIp)) {
+                  layer.openPopup();
+                }
+              }
+            } catch (e) {}
+          });
+        }, 600);
+      }
     })();
+    // --- end main() replacement ---
+
   })();
   </script>
 </body>
