@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-net-scout UI (Flask app) - updated with logs API and fixed progress logic.
+net-scout UI (Flask app) - patched with trace-route page and trace API.
 
 Run from net-sentinel/net-scout:
   python3 ui.py
@@ -16,6 +16,7 @@ import threading
 import shlex
 import time
 import glob
+import re
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, render_template, abort
 
@@ -74,10 +75,6 @@ def read_log_tail(path, max_lines=500):
             return []
 
 def find_running_tasks():
-    """
-    Best-effort detection of running scout/enrich tasks using pgrep.
-    Returns dict with booleans and PIDs list.
-    """
     tasks = {"scan_running": False, "scan_pids": [], "enrich_running": False, "enrich_pids": []}
     try:
         out = subprocess.run(["pgrep", "-f", "scout.py"], capture_output=True, text=True)
@@ -98,14 +95,6 @@ def find_running_tasks():
     return tasks
 
 def parse_scan_log_for_progress(path):
-    """
-    Parse scan log to estimate progress:
-    - look for 'scanning since' (start time)
-    - look for 'candidate alerts detected' (total candidates)
-    - count '[INSERTED]' or '[DRY RUN] Alert:' lines as processed
-    - detect '[DONE] scan complete' as finished
-    Return dict: {started_at, finished, total_candidates, processed, percent, est_remaining_seconds, last_lines}
-    """
     lines = read_log_tail(path, max_lines=2000)
     started_at = None
     finished = False
@@ -122,8 +111,6 @@ def parse_scan_log_for_progress(path):
                 pass
         if "candidate alerts detected" in ln:
             try:
-                # extract integer from line
-                import re
                 m = re.search(r"(\d+)\s+candidate alerts detected", ln)
                 if m:
                     total_candidates = int(m.group(1))
@@ -133,10 +120,8 @@ def parse_scan_log_for_progress(path):
             processed += 1
         if "[DONE] scan complete" in ln:
             finished = True
-        # try to parse ISO timestamp at start of line
         try:
             ts = ln.strip().split()[0]
-            # naive check for ISO-like timestamp
             if "T" in ts and ("Z" in ts or "+" in ts):
                 timestamps.append(ts)
         except Exception:
@@ -150,16 +135,13 @@ def parse_scan_log_for_progress(path):
     else:
         if total_candidates:
             percent = int(min(100, (processed / max(1, total_candidates)) * 100))
-            # estimate remaining time using timestamps if available
             try:
                 if timestamps and started_at:
-                    # use file mtime as fallback for elapsed
                     elapsed = None
                     try:
                         elapsed = time.time() - os.path.getmtime(path)
                     except Exception:
                         elapsed = None
-                    # fallback: assume 0.5s per processed if processed>0
                     if processed > 0:
                         per_item = elapsed / processed if elapsed and elapsed > 0 else 0.5
                         est_remaining = int(max(0, (total_candidates - processed) * per_item))
@@ -168,7 +150,6 @@ def parse_scan_log_for_progress(path):
             except Exception:
                 est_remaining = None
         else:
-            # no total info; if process running, show 50; else 0
             tasks = find_running_tasks()
             percent = 50 if tasks.get("scan_running") else 0
 
@@ -183,10 +164,6 @@ def parse_scan_log_for_progress(path):
     }
 
 def parse_enrich_logs_for_progress(log_dir):
-    """
-    Look for netscout_enrich_*.log files and parse them for enrichment progress.
-    Count 'enriched alert' occurrences and 'Enriching alert' markers.
-    """
     files = glob.glob(os.path.join(log_dir, "netscout_enrich_*.log"))
     total_processed = 0
     total_started = 0
@@ -214,7 +191,7 @@ def parse_enrich_logs_for_progress(log_dir):
     }
 
 # -------------------------
-# DB helpers (unchanged)
+# DB helpers
 # -------------------------
 def fetch_alerts_from_db(since=None, limit=500, alert_type=None, src_ip=None, dst_ip=None, min_score=None):
     if not os.path.exists(DB_PATH):
@@ -278,11 +255,145 @@ def fetch_alerts_from_db(since=None, limit=500, alert_type=None, src_ip=None, ds
     return alerts
 
 # -------------------------
-# API endpoints
+# Traceroute parsing / run helpers
+# -------------------------
+def parse_traceroute_text(raw_text):
+    """
+    Best-effort parse of traceroute output into list of hops.
+    Each hop is a dict: {hop:int, ip:str or None, rdns:str or None, times:[...], output:line}
+    """
+    hops = []
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Typical line starts with hop number
+        m = re.match(r"^\s*(\d+)\s+(.*)$", line)
+        if not m:
+            # not a hop line, include as raw output
+            continue
+        hopnum = int(m.group(1))
+        rest = m.group(2).strip()
+        # If line contains '*' only (no response)
+        if rest.startswith("*"):
+            hops.append({"hop": hopnum, "ip": None, "rdns": None, "times": [], "output": line})
+            continue
+        # Try to extract first IP and optional rdns
+        # Examples:
+        # "RT-AX88U_Pro-0810 (192.168.50.1)  0.710 ms  0.683 ms  0.711 ms"
+        # "192.168.50.1  22.468 ms  22.436 ms  22.424 ms"
+        ip = None
+        rdns = None
+        times = []
+        # find tokens that look like (name) (ip) or ip alone
+        # find first parenthesized IP
+        pm = re.search(r"\((\d{1,3}(?:\.\d{1,3}){3})\)", rest)
+        if pm:
+            ip = pm.group(1)
+            # rdns is the token before the parentheses
+            before = rest[:pm.start()].strip()
+            rdns = before if before else None
+        else:
+            # try to find first bare IP
+            im = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", rest)
+            if im:
+                ip = im.group(1)
+                # attempt to extract rdns if present before ip
+                before = rest[:im.start()].strip()
+                if before and not before.startswith("*"):
+                    rdns = before.split()[0]
+        # extract times (ms)
+        tms = re.findall(r"(\d+\.\d+)\s*ms", rest)
+        times = [float(x) for x in tms]
+        hops.append({"hop": hopnum, "ip": ip, "rdns": rdns, "times": times, "output": line})
+    return hops
+
+def geo_enrich_hops(hops, conn=None):
+    """
+    Try to attach lat/lon/country/state/city to hops using:
+      - enrichment JSON stored in scout_alerts (if available)
+      - ip_events table (most recent)
+      - scout_enrichment_cache geo_map if present
+    This function mutates hops in place.
+    """
+    close_conn = False
+    if conn is None:
+        if not os.path.exists(DB_PATH):
+            return hops
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        close_conn = True
+
+    # Build a set of IPs to look up
+    ips = [h["ip"] for h in hops if h.get("ip")]
+    ips = list(dict.fromkeys([i for i in ips if i]))  # unique preserving order
+
+    # Try ip_events table for lat/lon
+    if ips:
+        q = "SELECT src_ip, dst_ip, latitude, longitude, country, region, city FROM ip_events WHERE (src_ip IN ({0}) OR dst_ip IN ({0})) AND latitude IS NOT NULL AND longitude IS NOT NULL ORDER BY timestamp DESC".format(",".join("?" for _ in ips))
+        try:
+            rows = conn.execute(q, ips + ips).fetchall()
+            # build map ip -> geo
+            geo_map = {}
+            for r in rows:
+                # prefer src_ip match then dst_ip
+                for candidate in (r["src_ip"], r["dst_ip"]):
+                    if candidate and candidate not in geo_map:
+                        geo_map[candidate] = {
+                            "lat": r["latitude"],
+                            "lon": r["longitude"],
+                            "country": r.get("country"),
+                            "state": r.get("region"),
+                            "city": r.get("city")
+                        }
+            # attach
+            for h in hops:
+                ip = h.get("ip")
+                if ip and ip in geo_map:
+                    g = geo_map[ip]
+                    h["lat"] = g.get("lat")
+                    h["lon"] = g.get("lon")
+                    h["country"] = g.get("country")
+                    h["state"] = g.get("state")
+                    h["city"] = g.get("city")
+        except Exception:
+            pass
+
+    if close_conn:
+        conn.close()
+    return hops
+
+def run_system_traceroute(target, max_hops=30, timeout=30):
+    """
+    Run system traceroute command and return raw stdout text.
+    Uses 'traceroute' binary; this may not be available on all systems.
+    Returns (success_bool, stdout_text, stderr_text)
+    """
+    # prefer 'traceroute' command; fallback to 'tracert' on Windows (not implemented)
+    cmd = ["traceroute", "-m", str(max_hops), target]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return (proc.returncode == 0 or proc.returncode == 1, proc.stdout or "", proc.stderr or "")
+    except subprocess.TimeoutExpired as e:
+        return (False, getattr(e, "output", "") or "", "timeout")
+    except FileNotFoundError:
+        return (False, "", "traceroute binary not found on server")
+    except Exception as e:
+        return (False, "", str(e))
+
+# -------------------------
+# API endpoints and pages
 # -------------------------
 @app.route("/netscout")
 def netscout_ui():
     return render_template("netscout.html")
+
+@app.route("/trace_route")
+def trace_route_ui():
+    """
+    Render the trace-route page. Expects query param ?alert_id=<id>.
+    """
+    return render_template("trace_route.html")
 
 @app.route("/api/alerts", methods=["GET"])
 def api_alerts():
@@ -364,7 +475,7 @@ def api_enrich_bulk():
         run_subprocess_async(cmd, out_file=logpath)
         return jsonify({"status": "started", "log": logpath})
     else:
-        return jsonify({"error": "alert_ids or limit required"}), 400
+        return jsonify({"error": "alert_ids or limit required"}), 400)
 
 @app.route("/api/enrichment_cache", methods=["GET"])
 def api_enrichment_cache():
@@ -412,9 +523,6 @@ def api_snooze_alert():
 # -------------------------
 @app.route("/api/logs", methods=["GET"])
 def api_logs():
-    """
-    Return list of log files in LOG_DIR sorted by mtime desc.
-    """
     if not os.path.exists(LOG_DIR):
         return jsonify({"logs": []})
     files = glob.glob(os.path.join(LOG_DIR, "*.log"))
@@ -431,11 +539,6 @@ def api_logs():
 
 @app.route("/api/log_tail", methods=["GET"])
 def api_log_tail():
-    """
-    Query params:
-      name=<basename>  (required)
-      lines=<n>        (optional, default 200)
-    """
     name = request.args.get("name")
     lines = int(request.args.get("lines", "200"))
     if not name:
@@ -445,6 +548,142 @@ def api_log_tail():
         return jsonify({"error": "log not found"}), 404
     tail = read_log_tail(path, max_lines=lines)
     return jsonify({"name": name, "lines": tail})
+
+# -------------------------
+# Trace API (existing)
+# -------------------------
+@app.route("/api/trace", methods=["GET"])
+def api_trace():
+    """
+    Return stored enrichment traceroute data for an alert (if present).
+    """
+    alert_id = request.args.get("alert_id")
+    if not alert_id:
+        return jsonify({"error": "alert_id required"}), 400
+
+    if not os.path.exists(DB_PATH):
+        return jsonify({"error": f"DB not found at {DB_PATH}"}), 500
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    row = cur.execute("SELECT enrichment_json, dst_ip, src_ip FROM scout_alerts WHERE id = ? LIMIT 1", (alert_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "alert not found"}), 404
+
+    enrichment_raw = row["enrichment_json"] or ""
+    try:
+        enrichment = json.loads(enrichment_raw) if enrichment_raw else {}
+    except Exception:
+        enrichment = {}
+
+    # Prefer structured hops if present
+    hops = enrichment.get("hops") or enrichment.get("traceroute_hops") or []
+    raw_output = enrichment.get("src_traceroute") or enrichment.get("dst_traceroute") or enrichment.get("traceroute") or enrichment.get("raw_traceroute") or ""
+
+    # If no structured hops but raw_output exists, attempt a best-effort parse
+    if not hops and raw_output:
+        hops = parse_traceroute_text(raw_output)
+
+    # Attach rdns_map if present
+    rdns_map = enrichment.get("rdns_map") or enrichment.get("rdns") or {}
+    if isinstance(rdns_map, dict) and hops:
+        for h in hops:
+            ip = h.get("ip")
+            if ip and ip in rdns_map:
+                h["rdns"] = rdns_map[ip]
+
+    # Try to enrich with geo info from enrichment or ip_events
+    geo_map = enrichment.get("geo_map") or {}
+    if isinstance(geo_map, dict) and hops:
+        for h in hops:
+            ip = h.get("ip")
+            if ip and ip in geo_map:
+                g = geo_map[ip]
+                h["lat"] = g.get("lat") or g.get("latitude")
+                h["lon"] = g.get("lon") or g.get("longitude")
+                h["country"] = g.get("country")
+                h["state"] = g.get("region")
+                h["city"] = g.get("city")
+
+    # fallback: try ip_events lookup
+    hops = geo_enrich_hops(hops, conn=conn)
+
+    conn.close()
+    return jsonify({"hops": hops, "raw_output": raw_output, "dst_ip": row["dst_ip"], "src_ip": row["src_ip"]})
+
+# -------------------------
+# Trace-run endpoint (new)
+# -------------------------
+@app.route("/api/trace_run", methods=["POST"])
+def api_trace_run():
+    """
+    Run traceroute on the server for a given target or alert_id.
+    POST JSON:
+      { "alert_id": <id> }  OR { "target": "1.2.3.4" }
+    Returns:
+      { "hops": [...], "raw_output": "...", "target": "..." }
+    """
+    data = request.get_json() or {}
+    alert_id = data.get("alert_id")
+    target = data.get("target")
+    max_hops = int(data.get("max_hops", 30))
+
+    # If alert_id provided, try to get dst_ip (or src_ip) from DB
+    if alert_id and not target:
+        if not os.path.exists(DB_PATH):
+            return jsonify({"error": f"DB not found at {DB_PATH}"}), 500
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT dst_ip, src_ip FROM scout_alerts WHERE id = ? LIMIT 1", (alert_id,)).fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"error": "alert not found"}), 404
+        target = row["dst_ip"] or row["src_ip"]
+        if not target:
+            return jsonify({"error": "no target ip available for alert"}), 400
+
+    if not target:
+        return jsonify({"error": "target or alert_id required"}), 400
+
+    # Run traceroute on server
+    ok, stdout, stderr = run_system_traceroute(target, max_hops=max_hops, timeout=60)
+    raw_output = stdout or stderr or ""
+    if not raw_output:
+        return jsonify({"error": "no traceroute output", "stderr": stderr}), 500
+
+    # Parse hops
+    hops = parse_traceroute_text(raw_output)
+
+    # Try to attach rdns_map if possible by resolving names in output (best-effort)
+    # If a hop has ip but no rdns, attempt a reverse DNS lookup (non-blocking best-effort)
+    for h in hops:
+        if h.get("ip") and not h.get("rdns"):
+            try:
+                # use socket.gethostbyaddr (may block); keep short timeout by running in subprocess 'host' if available
+                import socket
+                try:
+                    rdns = socket.gethostbyaddr(h["ip"])[0]
+                    h["rdns"] = rdns
+                except Exception:
+                    h["rdns"] = None
+            except Exception:
+                h["rdns"] = None
+
+    # Geo-enrich hops using ip_events or enrichment cache
+    try:
+        conn = None
+        if os.path.exists(DB_PATH):
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+        geo_enrich_hops(hops, conn=conn)
+        if conn:
+            conn.close()
+    except Exception:
+        pass
+
+    return jsonify({"hops": hops, "raw_output": raw_output, "target": target})
 
 # -------------------------
 # Enrichment UI page
