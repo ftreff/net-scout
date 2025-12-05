@@ -540,7 +540,7 @@ def api_logs():
 @app.route("/api/log_tail", methods=["GET"])
 def api_log_tail():
     name = request.args.get("name")
-    lines = int(request.args.get("lines", "200"))
+    lines = int(request.args.get("lines", "50"))
     if not name:
         return jsonify({"error": "name required"}), 400
     path = os.path.join(LOG_DIR, name)
