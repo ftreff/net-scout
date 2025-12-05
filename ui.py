@@ -17,6 +17,7 @@ import shlex
 import time
 import glob
 import re
+import shutil
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, render_template, abort
 
@@ -363,23 +364,52 @@ def geo_enrich_hops(hops, conn=None):
         conn.close()
     return hops
 
-def run_system_traceroute(target, max_hops=30, timeout=30):
+import shutil
+
+def run_system_traceroute(target, max_hops=30, timeout=60, per_probe_wait=5, probes_per_hop=3):
     """
-    Run system traceroute command and return raw stdout text.
-    Uses 'traceroute' binary; this may not be available on all systems.
-    Returns (success_bool, stdout_text, stderr_text)
+    Run traceroute with a few fallbacks:
+      1) UDP (default) with -n -m -w -q
+      2) ICMP (-I) if UDP returns nothing
+      3) TCP (-T) if available
+    Returns (success_bool, stdout_text, stderr_text, used_cmd)
     """
-    # prefer 'traceroute' command; fallback to 'tracert' on Windows (not implemented)
-    cmd = ["traceroute", "-m", str(max_hops), target]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return (proc.returncode == 0 or proc.returncode == 1, proc.stdout or "", proc.stderr or "")
-    except subprocess.TimeoutExpired as e:
-        return (False, getattr(e, "output", "") or "", "timeout")
-    except FileNotFoundError:
-        return (False, "", "traceroute binary not found on server")
-    except Exception as e:
-        return (False, "", str(e))
+    # find traceroute binary
+    traceroute_bin = shutil.which("traceroute")
+    if not traceroute_bin:
+        return (False, "", "traceroute binary not found on server", None)
+
+    base_args = [traceroute_bin, "-n", "-m", str(max_hops), "-w", str(per_probe_wait), "-q", str(probes_per_hop)]
+    # try UDP first (default)
+    cmds = [
+        base_args + [target],
+        base_args + ["-I", target],   # ICMP
+        base_args + ["-T", target],   # TCP (if supported)
+    ]
+
+    last_stdout = ""
+    last_stderr = ""
+    for cmd in cmds:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            stdout = proc.stdout or ""
+            stderr = proc.stderr or ""
+            last_stdout = stdout
+            last_stderr = stderr
+            # return success if we got any output lines or non-empty stdout
+            if stdout.strip():
+                return (True, stdout, stderr, " ".join(shlex.quote(p) for p in cmd))
+            # some traceroute return non-zero but still produce useful stderr; keep trying
+        except subprocess.TimeoutExpired as e:
+            last_stdout = getattr(e, "output", "") or ""
+            last_stderr = "timeout"
+        except Exception as e:
+            last_stdout = ""
+            last_stderr = str(e)
+
+    # nothing produced useful
+    return (False, last_stdout, last_stderr, " ".join(shlex.quote(p) for p in cmds[-1]))
+
 
 # -------------------------
 # API endpoints and pages
