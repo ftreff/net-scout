@@ -1,4 +1,5 @@
 // netscout.js - patched: fixes auto-zoom, popup styling, rdns display, Trace Route button
+// Added defensive Leaflet loader so the app waits for Leaflet before calling initMap(), wireUi(), startPolling().
 
 const API_BASE = "/api";
 let map, markersLayer;
@@ -28,6 +29,55 @@ function applyTopbarTheme(theme) {
     topbar.style.color = "#111";
     document.documentElement.setAttribute("data-theme", "light");
   }
+}
+
+/* Defensive Leaflet loader
+   - If Leaflet (L) is already present, resolves immediately.
+   - If not, injects CSS and JS from CDN and resolves when L is available.
+   - Guards against multiple concurrent loaders.
+*/
+function ensureLeaflet() {
+  return new Promise((resolve, reject) => {
+    if (typeof L !== "undefined") return resolve();
+
+    // If another loader is running, poll until L is available
+    if (window.__leaflet_loading__) {
+      const waitForL = () => {
+        if (typeof L !== "undefined") return resolve();
+        setTimeout(waitForL, 100);
+      };
+      return waitForL();
+    }
+
+    window.__leaflet_loading__ = true;
+
+    // Inject CSS
+    try {
+      const css = document.createElement("link");
+      css.rel = "stylesheet";
+      css.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+      document.head.appendChild(css);
+    } catch (e) {
+      console.warn("Failed to inject Leaflet CSS", e);
+    }
+
+    // Inject JS
+    const s = document.createElement("script");
+    s.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+    s.async = true;
+    s.onload = () => {
+      // small delay to ensure global is available
+      setTimeout(() => {
+        if (typeof L !== "undefined") resolve();
+        else reject(new Error("Leaflet loaded but L is undefined"));
+      }, 50);
+    };
+    s.onerror = (err) => {
+      console.error("Failed to load Leaflet script", err);
+      reject(err);
+    };
+    document.head.appendChild(s);
+  });
 }
 
 function ensureMap() {
@@ -435,8 +485,30 @@ function startPolling() {
   if (autoStatus) autoStatus.textContent = enabled ? `on (${interval/1000}s)` : 'off';
 }
 
-window.addEventListener("load", () => {
-  initMap();
-  wireUi();
-  startPolling();
+// Guarded startup: wait for Leaflet to be available before initializing map and UI
+window.addEventListener("load", async () => {
+  try {
+    await ensureLeaflet();
+  } catch (err) {
+    console.warn("Leaflet failed to load, continuing without map:", err);
+  }
+
+  // Initialize map and UI safely
+  try {
+    initMap();
+  } catch (e) {
+    console.error("initMap failed:", e);
+  }
+
+  try {
+    wireUi();
+  } catch (e) {
+    console.error("wireUi failed:", e);
+  }
+
+  try {
+    startPolling();
+  } catch (e) {
+    console.error("startPolling failed:", e);
+  }
 });
