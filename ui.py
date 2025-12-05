@@ -505,7 +505,7 @@ def api_enrich_bulk():
         run_subprocess_async(cmd, out_file=logpath)
         return jsonify({"status": "started", "log": logpath})
     else:
-        return jsonify({"error": "alert_ids or limit required"}), 400)
+        return jsonify({"error": "alert_ids or limit required"}), 400
 
 @app.route("/api/enrichment_cache", methods=["GET"])
 def api_enrichment_cache():
