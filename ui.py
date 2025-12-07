@@ -33,9 +33,9 @@ app = Flask(__name__, template_folder="templates", static_folder="static")
 
 # Optional geoip2 import (may not be installed)
 try:
-    import geoip2.database
+    import geoip2.database as geoip2_db
 except Exception:
-    geoip2 = None
+    geoip2_db = None
 
 # -------------------------
 # Helpers
@@ -554,7 +554,7 @@ def api_log_tail():
     return jsonify({"name": name, "lines": tail})
 
 # -------------------------
-# Trace API (existing)
+# Trace API (existing, patched to apply Troy rule and GeoIP)
 # -------------------------
 @app.route("/api/trace", methods=["GET"])
 def api_trace():
@@ -598,20 +598,53 @@ def api_trace():
             if ip and ip in rdns_map:
                 h["rdns"] = rdns_map[ip]
 
-    # Try to enrich with geo info from enrichment or ip_events
-    geo_map = enrichment.get("geo_map") or {}
-    if isinstance(geo_map, dict) and hops:
-        for h in hops:
-            ip = h.get("ip")
-            if ip and ip in geo_map:
-                g = geo_map[ip]
-                h["lat"] = g.get("lat") or g.get("latitude")
-                h["lon"] = g.get("lon") or g.get("longitude")
-                h["country"] = g.get("country")
-                h["state"] = g.get("region")
-                h["city"] = g.get("city")
+    # GeoIP DB path (robust)
+    geoip_db_path = os.path.join(PROJECT_ROOT, "data", "geoip", "GeoLite2-City.mmdb")
+    geo_reader = None
+    if geoip2_db and os.path.exists(geoip_db_path):
+        try:
+            geo_reader = geoip2_db.Reader(geoip_db_path)
+        except Exception:
+            geo_reader = None
 
-    # fallback: try ip_events lookup
+    # Apply Troy rule and GeoIP lookup for hops that lack lat/lon
+    for h in hops:
+        ip = h.get("ip")
+        if not ip:
+            continue
+        # Troy LAN rule
+        if ip.startswith("192.168.50."):
+            h["lat"] = 42.7284
+            h["lon"] = -73.6918
+            h["country"] = "US"
+            h["state"] = "NY"
+            h["city"] = "Troy"
+            continue
+        # If enrichment already provided geo_map, skip
+        if h.get("lat") and h.get("lon"):
+            continue
+        # Try GeoIP
+        if geo_reader:
+            try:
+                rec = geo_reader.city(ip)
+                if rec and rec.location and (rec.location.latitude is not None and rec.location.longitude is not None):
+                    h["lat"] = rec.location.latitude
+                    h["lon"] = rec.location.longitude
+                    h["country"] = rec.country.iso_code
+                    h["state"] = (rec.subdivisions and rec.subdivisions.most_specific.name) or None
+                    h["city"] = rec.city.name or None
+                    continue
+            except Exception:
+                pass
+
+    # Close geo reader if opened
+    if geo_reader:
+        try:
+            geo_reader.close()
+        except Exception:
+            pass
+
+    # fallback: try ip_events lookup for any remaining hops
     hops = geo_enrich_hops(hops, conn=conn)
 
     conn.close()
@@ -671,12 +704,12 @@ def api_trace_run():
             except Exception:
                 h["rdns"] = None
 
-    # GeoIP DB path (robust, relative to PROJECT_ROOT/data/geoip/GeoLite2-City.mmdb)
+    # GeoIP DB path (robust)
     geoip_db_path = os.path.join(PROJECT_ROOT, "data", "geoip", "GeoLite2-City.mmdb")
     geo_reader = None
-    if geoip2 and os.path.exists(geoip_db_path):
+    if geoip2_db and os.path.exists(geoip_db_path):
         try:
-            geo_reader = geoip2.database.Reader(geoip_db_path)
+            geo_reader = geoip2_db.Reader(geoip_db_path)
         except Exception:
             geo_reader = None
 
@@ -752,7 +785,6 @@ def api_trace_run():
                     enrichment = {}
             enrichment["traceroute_hops"] = hops
             enrichment["traceroute_raw"] = raw_output
-            # Optionally store the command and stderr for debugging
             enrichment.setdefault("traceroute_meta", {})
             enrichment["traceroute_meta"]["cmd"] = used_cmd
             enrichment["traceroute_meta"]["stderr"] = stderr
