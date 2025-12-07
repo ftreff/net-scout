@@ -21,6 +21,7 @@ import shutil
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request, render_template, abort
 
+# Project layout helpers
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(PROJECT_ROOT, "net_sentinel.db")
 SCOUT_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scout.py")
@@ -29,6 +30,12 @@ LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 SCAN_LOG = os.path.join(LOG_DIR, "netscout_scan.log")
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
+
+# Optional geoip2 import (may not be installed)
+try:
+    import geoip2.database
+except Exception:
+    geoip2 = None
 
 # -------------------------
 # Helpers
@@ -280,30 +287,21 @@ def parse_traceroute_text(raw_text):
             hops.append({"hop": hopnum, "ip": None, "rdns": None, "times": [], "output": line})
             continue
         # Try to extract first IP and optional rdns
-        # Examples:
-        # "RT-AX88U_Pro-0810 (192.168.50.1)  0.710 ms  0.683 ms  0.711 ms"
-        # "192.168.50.1  22.468 ms  22.436 ms  22.424 ms"
         ip = None
         rdns = None
         times = []
-        # find tokens that look like (name) (ip) or ip alone
-        # find first parenthesized IP
         pm = re.search(r"\((\d{1,3}(?:\.\d{1,3}){3})\)", rest)
         if pm:
             ip = pm.group(1)
-            # rdns is the token before the parentheses
             before = rest[:pm.start()].strip()
             rdns = before if before else None
         else:
-            # try to find first bare IP
             im = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", rest)
             if im:
                 ip = im.group(1)
-                # attempt to extract rdns if present before ip
                 before = rest[:im.start()].strip()
                 if before and not before.startswith("*"):
                     rdns = before.split()[0]
-        # extract times (ms)
         tms = re.findall(r"(\d+\.\d+)\s*ms", rest)
         times = [float(x) for x in tms]
         hops.append({"hop": hopnum, "ip": ip, "rdns": rdns, "times": times, "output": line})
@@ -312,7 +310,6 @@ def parse_traceroute_text(raw_text):
 def geo_enrich_hops(hops, conn=None):
     """
     Try to attach lat/lon/country/state/city to hops using:
-      - enrichment JSON stored in scout_alerts (if available)
       - ip_events table (most recent)
       - scout_enrichment_cache geo_map if present
     This function mutates hops in place.
@@ -337,7 +334,6 @@ def geo_enrich_hops(hops, conn=None):
             # build map ip -> geo
             geo_map = {}
             for r in rows:
-                # prefer src_ip match then dst_ip
                 for candidate in (r["src_ip"], r["dst_ip"]):
                     if candidate and candidate not in geo_map:
                         geo_map[candidate] = {
@@ -364,52 +360,30 @@ def geo_enrich_hops(hops, conn=None):
         conn.close()
     return hops
 
-import shutil
-
-def run_system_traceroute(target, max_hops=30, timeout=60, per_probe_wait=5, probes_per_hop=3):
+# -------------------------
+# Traceroute runner (single run) - patched
+# -------------------------
+def run_system_traceroute(target, max_hops=30, timeout=120, per_probe_wait=5, probes_per_hop=3):
     """
-    Run traceroute with a few fallbacks:
-      1) UDP (default) with -n -m -w -q
-      2) ICMP (-I) if UDP returns nothing
-      3) TCP (-T) if available
-    Returns (success_bool, stdout_text, stderr_text, used_cmd)
+    Run traceroute once (UDP default). Return (ok, stdout, stderr, used_cmd).
+    No automatic second-run attempts here.
     """
-    # find traceroute binary
     traceroute_bin = shutil.which("traceroute")
     if not traceroute_bin:
         return (False, "", "traceroute binary not found on server", None)
 
-    base_args = [traceroute_bin, "-n", "-m", str(max_hops), "-w", str(per_probe_wait), "-q", str(probes_per_hop)]
-    # try UDP first (default)
-    cmds = [
-        base_args + [target],
-        base_args + ["-I", target],   # ICMP
-        base_args + ["-T", target],   # TCP (if supported)
-    ]
-
-    last_stdout = ""
-    last_stderr = ""
-    for cmd in cmds:
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            stdout = proc.stdout or ""
-            stderr = proc.stderr or ""
-            last_stdout = stdout
-            last_stderr = stderr
-            # return success if we got any output lines or non-empty stdout
-            if stdout.strip():
-                return (True, stdout, stderr, " ".join(shlex.quote(p) for p in cmd))
-            # some traceroute return non-zero but still produce useful stderr; keep trying
-        except subprocess.TimeoutExpired as e:
-            last_stdout = getattr(e, "output", "") or ""
-            last_stderr = "timeout"
-        except Exception as e:
-            last_stdout = ""
-            last_stderr = str(e)
-
-    # nothing produced useful
-    return (False, last_stdout, last_stderr, " ".join(shlex.quote(p) for p in cmds[-1]))
-
+    cmd = [traceroute_bin, "-n", "-m", str(max_hops), "-w", str(per_probe_wait), "-q", str(probes_per_hop), target]
+    used_cmd = " ".join(shlex.quote(p) for p in cmd)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        ok = bool(stdout.strip())
+        return (ok, stdout, stderr, used_cmd)
+    except subprocess.TimeoutExpired as e:
+        return (False, getattr(e, "output", "") or "", "timeout", used_cmd)
+    except Exception as e:
+        return (False, "", str(e), used_cmd)
 
 # -------------------------
 # API endpoints and pages
@@ -610,7 +584,7 @@ def api_trace():
 
     # Prefer structured hops if present
     hops = enrichment.get("hops") or enrichment.get("traceroute_hops") or []
-    raw_output = enrichment.get("src_traceroute") or enrichment.get("dst_traceroute") or enrichment.get("traceroute") or enrichment.get("raw_traceroute") or ""
+    raw_output = enrichment.get("src_traceroute") or enrichment.get("dst_traceroute") or enrichment.get("traceroute") or enrichment.get("traceroute_raw") or enrichment.get("raw_traceroute") or ""
 
     # If no structured hops but raw_output exists, attempt a best-effort parse
     if not hops and raw_output:
@@ -644,7 +618,7 @@ def api_trace():
     return jsonify({"hops": hops, "raw_output": raw_output, "dst_ip": row["dst_ip"], "src_ip": row["src_ip"]})
 
 # -------------------------
-# Trace-run endpoint (new)
+# Trace-run endpoint (patched)
 # -------------------------
 @app.route("/api/trace_run", methods=["POST"])
 def api_trace_run():
@@ -653,7 +627,7 @@ def api_trace_run():
     POST JSON:
       { "alert_id": <id> }  OR { "target": "1.2.3.4" }
     Returns:
-      { "hops": [...], "raw_output": "...", "target": "..." }
+      { "hops": [...], "raw_output": "...", "target": "...", "cmd": "...", "stderr": "...", "success": bool }
     """
     data = request.get_json() or {}
     alert_id = data.get("alert_id")
@@ -666,7 +640,7 @@ def api_trace_run():
             return jsonify({"error": f"DB not found at {DB_PATH}"}), 500
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT dst_ip, src_ip FROM scout_alerts WHERE id = ? LIMIT 1", (alert_id,)).fetchone()
+        row = conn.execute("SELECT dst_ip, src_ip, enrichment_json FROM scout_alerts WHERE id = ? LIMIT 1", (alert_id,)).fetchone()
         conn.close()
         if not row:
             return jsonify({"error": "alert not found"}), 404
@@ -677,21 +651,17 @@ def api_trace_run():
     if not target:
         return jsonify({"error": "target or alert_id required"}), 400
 
-    # Run traceroute on server
-    ok, stdout, stderr = run_system_traceroute(target, max_hops=max_hops, timeout=60)
+    # Run traceroute once
+    ok, stdout, stderr, used_cmd = run_system_traceroute(target, max_hops=max_hops, timeout=120)
     raw_output = stdout or stderr or ""
-    if not raw_output:
-        return jsonify({"error": "no traceroute output", "stderr": stderr}), 500
 
     # Parse hops
     hops = parse_traceroute_text(raw_output)
 
-    # Try to attach rdns_map if possible by resolving names in output (best-effort)
-    # If a hop has ip but no rdns, attempt a reverse DNS lookup (non-blocking best-effort)
+    # Best-effort reverse DNS for hops missing rdns
     for h in hops:
         if h.get("ip") and not h.get("rdns"):
             try:
-                # use socket.gethostbyaddr (may block); keep short timeout by running in subprocess 'host' if available
                 import socket
                 try:
                     rdns = socket.gethostbyaddr(h["ip"])[0]
@@ -701,7 +671,61 @@ def api_trace_run():
             except Exception:
                 h["rdns"] = None
 
-    # Geo-enrich hops using ip_events or enrichment cache
+    # GeoIP DB path (robust, relative to PROJECT_ROOT/data/geoip/GeoLite2-City.mmdb)
+    geoip_db_path = os.path.join(PROJECT_ROOT, "data", "geoip", "GeoLite2-City.mmdb")
+    geo_reader = None
+    if geoip2 and os.path.exists(geoip_db_path):
+        try:
+            geo_reader = geoip2.database.Reader(geoip_db_path)
+        except Exception:
+            geo_reader = None
+
+    # Helper: set Troy coords for 192.168.50.*
+    def set_troy(h):
+        h["lat"] = 42.7284
+        h["lon"] = -73.6918
+        h["country"] = "US"
+        h["state"] = "NY"
+        h["city"] = "Troy"
+        return h
+
+    # Enrich hops with geo info (GeoIP or ip_events) and apply Troy rule
+    for h in hops:
+        ip = h.get("ip")
+        if not ip:
+            # skip missing hops (no IP)
+            continue
+
+        # Troy LAN rule
+        if ip.startswith("192.168.50."):
+            set_troy(h)
+            continue
+
+        # Try GeoIP lookup if available
+        if geo_reader:
+            try:
+                rec = geo_reader.city(ip)
+                if rec and rec.location and (rec.location.latitude is not None and rec.location.longitude is not None):
+                    h["lat"] = rec.location.latitude
+                    h["lon"] = rec.location.longitude
+                    h["country"] = rec.country.iso_code
+                    h["state"] = (rec.subdivisions and rec.subdivisions.most_specific.name) or None
+                    h["city"] = rec.city.name or None
+                    continue
+            except Exception:
+                # ignore geoip errors and continue
+                pass
+
+        # If no geo info from GeoIP, leave lat/lon absent; geo_enrich_hops will try ip_events below
+
+    # Close geo reader if opened
+    if geo_reader:
+        try:
+            geo_reader.close()
+        except Exception:
+            pass
+
+    # Try to enrich with ip_events (DB) for any remaining hops
     try:
         conn = None
         if os.path.exists(DB_PATH):
@@ -713,7 +737,40 @@ def api_trace_run():
     except Exception:
         pass
 
-    return jsonify({"hops": hops, "raw_output": raw_output, "target": target})
+    # Persist traceroute_hops and raw output into enrichment_json for the alert (if alert_id provided)
+    if alert_id:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            row = cur.execute("SELECT enrichment_json FROM scout_alerts WHERE id = ? LIMIT 1", (alert_id,)).fetchone()
+            enrichment = {}
+            if row and row[0]:
+                try:
+                    enrichment = json.loads(row[0])
+                except Exception:
+                    enrichment = {}
+            enrichment["traceroute_hops"] = hops
+            enrichment["traceroute_raw"] = raw_output
+            # Optionally store the command and stderr for debugging
+            enrichment.setdefault("traceroute_meta", {})
+            enrichment["traceroute_meta"]["cmd"] = used_cmd
+            enrichment["traceroute_meta"]["stderr"] = stderr
+            cur.execute("UPDATE scout_alerts SET enrichment_json = ? WHERE id = ?", (json.dumps(enrichment), alert_id))
+            conn.commit()
+            conn.close()
+        except Exception:
+            # don't fail the API if DB persist fails; return the hops anyway
+            pass
+
+    return jsonify({
+        "hops": hops,
+        "raw_output": raw_output,
+        "target": target,
+        "cmd": used_cmd,
+        "stderr": stderr,
+        "success": ok
+    })
 
 # -------------------------
 # Enrichment UI page
