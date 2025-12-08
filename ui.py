@@ -269,6 +269,10 @@ def parse_traceroute_text(raw_text):
     """
     Best-effort parse of traceroute output into list of hops.
     Each hop is a dict: {hop:int, ip:str or None, rdns:str or None, times:[...], output:line}
+
+    This version finds the first IPv4 address anywhere on the hop line,
+    so lines like "* 66.109.6.21 384.915 ms" or "* * 61.88.33.4 449.500 ms"
+    will correctly extract the IP instead of being treated as a missing hop.
     """
     hops = []
     for line in raw_text.splitlines():
@@ -278,34 +282,51 @@ def parse_traceroute_text(raw_text):
         # Typical line starts with hop number
         m = re.match(r"^\s*(\d+)\s+(.*)$", line)
         if not m:
-            # not a hop line, include as raw output
+            # not a hop line, skip
             continue
         hopnum = int(m.group(1))
         rest = m.group(2).strip()
-        # If line contains '*' only (no response)
-        if rest.startswith("*"):
-            hops.append({"hop": hopnum, "ip": None, "rdns": None, "times": [], "output": line})
-            continue
-        # Try to extract first IP and optional rdns
+
+        # Extract times (ms) first (so we can keep them even if IP parsing is tricky)
+        tms = re.findall(r"(\d+\.\d+)\s*ms", rest)
+        times = [float(x) for x in tms]
+
+        # Try to find the first IPv4 anywhere in the rest of the line
         ip = None
         rdns = None
-        times = []
+
+        # First, look for parenthesized IP (name (ip) style)
         pm = re.search(r"\((\d{1,3}(?:\.\d{1,3}){3})\)", rest)
         if pm:
             ip = pm.group(1)
             before = rest[:pm.start()].strip()
             rdns = before if before else None
         else:
+            # find the first bare IPv4 anywhere
             im = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", rest)
             if im:
                 ip = im.group(1)
+                # attempt to extract rdns if present before ip (but ignore leading '*' tokens)
                 before = rest[:im.start()].strip()
-                if before and not before.startswith("*"):
-                    rdns = before.split()[0]
-        tms = re.findall(r"(\d+\.\d+)\s*ms", rest)
-        times = [float(x) for x in tms]
-        hops.append({"hop": hopnum, "ip": ip, "rdns": rdns, "times": times, "output": line})
+                # remove leading '*' tokens from the 'before' portion
+                before = re.sub(r"^\*+\s*", "", before).strip()
+                if before:
+                    # take the last token before the ip as rdns candidate
+                    rdns = before.split()[-1]
+                else:
+                    rdns = None
+
+        # If the line contains only '*' tokens and no IP, keep ip=None and times empty
+        # Build hop entry
+        hops.append({
+            "hop": hopnum,
+            "ip": ip,
+            "rdns": rdns,
+            "times": times,
+            "output": line
+        })
     return hops
+
 
 def geo_enrich_hops(hops, conn=None):
     """
