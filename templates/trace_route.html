@@ -21,6 +21,19 @@
     .trace-info { font-size:13px; line-height:1.25; }
     .muted { color:var(--muted); }
     .ns-pre { background: var(--popup-pre-bg); color: var(--popup-text); padding:6px; border-radius:4px; white-space:pre-wrap; font-family:monospace; font-size:12px; }
+    .hop-label-inline {
+      display:inline-block;
+      background: rgba(255,255,255,0.95);
+      border-radius:4px;
+      padding:2px 6px;
+      font-weight:700;
+      color:#000;
+      font-size:13px;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+      border: 1px solid rgba(0,0,0,0.08);
+      line-height:1;
+    }
+    .skipped-header { margin-top:10px; font-weight:600; color:var(--muted); }
     @media (max-width: 900px) {
       #mapWrap { height: 55vh; }
       #console { height:45vh; }
@@ -54,54 +67,26 @@
 
   <script>
   (function () {
-    const API_TRACE = "/api/trace";       // GET ?alert_id=...
-    const API_TRACE_RUN = "/api/trace_run"; // POST { alert_id } or { target }
+    const API_TRACE = "/api/trace";
+    const API_TRACE_RUN = "/api/trace_run";
     const params = new URLSearchParams(window.location.search);
     const alertId = params.get("alert_id");
     const focusIp = params.get("focus_ip") || null;
 
-    // Map and layers
     let map = null;
     let tileLight, tileDark;
     let markersLayer;
     let hopsPolyline = null;
     let currentTheme = localStorage.getItem("netscout_theme") || "dark";
 
-    // Troy fallback coordinates for 192.168.50.*
     const TROY = { lat: 42.7284, lon: -73.6918, city: "Troy", state: "NY", country: "US" };
 
     function initMap() {
       map = L.map("map", { zoomControl: true }).setView([20, 0], 2);
-
       tileLight = L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", { attribution: '&copy; OpenStreetMap contributors' });
       tileDark = L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { attribution: '&copy; OpenStreetMap contributors' });
-
-      if (currentTheme === "light") tileLight.addTo(map);
-      else tileDark.addTo(map);
-
+      if (currentTheme === "light") tileLight.addTo(map); else tileDark.addTo(map);
       markersLayer = L.layerGroup().addTo(map);
-
-      // Add auto-zoom control (top-left)
-      const AutoZoomControl = L.Control.extend({
-        options: { position: 'topleft' },
-        onAdd: function () {
-          const container = L.DomUtil.create('div', 'leaflet-bar');
-          const btn = L.DomUtil.create('a', '', container);
-          btn.href = '#';
-          btn.title = 'Auto-zoom to fit hops';
-          btn.innerHTML = '&#128269;';
-          btn.style.padding = '6px';
-          btn.style.display = 'flex';
-          btn.style.alignItems = 'center';
-          btn.style.justifyContent = 'center';
-          L.DomEvent.on(btn, 'click', L.DomEvent.stop).on(btn, 'click', (e) => {
-            fitToHops();
-          });
-          return container;
-        }
-      });
-      map.addControl(new AutoZoomControl());
-
       map.whenReady(() => setTimeout(() => map.invalidateSize(), 150));
       window.addEventListener("resize", () => setTimeout(() => map.invalidateSize(), 150));
     }
@@ -138,7 +123,7 @@
       return String(s).replace(/[&<>"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]; });
     }
 
-    function renderConsoleFormatted(hops, raw, meta) {
+    function renderConsoleFormatted(hops, raw, meta, plotted, skipped) {
       const el = document.getElementById("console");
       const lines = [];
       if (meta && meta.cmd) lines.push(`cmd: ${meta.cmd}`);
@@ -166,6 +151,12 @@
         lines.push("Raw traceroute output:");
         lines.push(raw);
       }
+
+      // plotted / skipped summary
+      lines.push("");
+      lines.push(`Plotted hops: ${plotted.length ? plotted.map(p => p.hop).join(", ") : "none"}`);
+      lines.push(`Skipped hops: ${skipped.length ? skipped.map(s => s.hop).join(", ") : "none"}`);
+
       el.textContent = lines.join("\n");
       el.scrollTop = el.scrollHeight;
     }
@@ -178,7 +169,7 @@
       if (h.city || h.state || h.country) {
         parts.push(`<div><b>Location:</b> ${escapeHtml([h.city, h.state, h.country].filter(Boolean).join(", "))}</div>`);
       }
-      if (h.lat && h.lon) parts.push(`<div class="ns-pre"><b>Lat, Lon:</b> ${h.lat}, ${h.lon}</div>`);
+      if (h.lat !== undefined && h.lon !== undefined && h.lat !== null && h.lon !== null) parts.push(`<div class="ns-pre"><b>Lat, Lon:</b> ${h.lat}, ${h.lon}</div>`);
       if (h.times && h.times.length) parts.push(`<div class="ns-pre">${h.times.join(" ms  ")} ms</div>`);
       if (h.output) parts.push(`<div class="ns-pre">${escapeHtml(h.output)}</div>`);
       return parts.join("");
@@ -193,39 +184,63 @@
 
       const latlngs = [];
       const sorted = (hops || []).slice().sort((a,b) => (a.hop||0) - (b.hop||0));
+      const skipped = [];
+      const plotted = [];
+
       sorted.forEach(h => {
-        // If server didn't provide lat/lon but IP is Troy LAN, apply client-side Troy coords
-        if ((!h.lat || !h.lon) && h.ip && h.ip.startsWith("192.168.50.")) {
+        // Client-side Troy fallback for 192.168.50.*
+        if ((h.lat === null || h.lat === undefined || h.lon === null || h.lon === undefined) && h.ip && h.ip.startsWith("192.168.50.")) {
           h.lat = TROY.lat;
           h.lon = TROY.lon;
           h.city = h.city || TROY.city;
           h.state = h.state || TROY.state;
           h.country = h.country || TROY.country;
         }
-        if (h.lat && h.lon) {
-          const lat = Number(h.lat);
-          const lon = Number(h.lon);
-          latlngs.push([lat, lon]);
-          const marker = L.circleMarker([lat, lon], {
-            radius: 8,
-            fillColor: "#2b9cff",
-            color: "#000",
-            weight: 1,
-            opacity: 1,
-            fillOpacity: 0.9
-          });
-          marker.bindPopup(buildHopPopup(h), { maxWidth: 420 });
-          marker.addTo(markersLayer);
-          const label = L.divIcon({ className: 'hop-marker', html: `<div style="background:rgba(255,255,255,0.9);padding:2px 6px;border-radius:4px;">${h.hop}</div>` });
-          L.marker([lat, lon], { icon: label, interactive: false }).addTo(markersLayer);
+
+        // Coerce to numbers and validate
+        let lat = (h.lat !== null && h.lat !== undefined) ? Number(h.lat) : NaN;
+        let lon = (h.lon !== null && h.lon !== undefined) ? Number(h.lon) : NaN;
+
+        if (!isFinite(lat) || !isFinite(lon)) {
+          skipped.push(h);
+          return;
         }
+
+        // valid numeric coords — plot
+        latlngs.push([lat, lon]);
+        plotted.push({ hop: h.hop, ip: h.ip, lat: lat, lon: lon });
+
+        // visible circle marker
+        const marker = L.circleMarker([lat, lon], {
+          radius: 7,
+          fillColor: "#2b9cff",
+          color: "#003049",
+          weight: 1,
+          opacity: 1,
+          fillOpacity: 0.95
+        });
+
+        marker.bindPopup(buildHopPopup(h), { maxWidth: 420 });
+        markersLayer.addLayer(marker);
+
+        // label icon with inline styling
+        const labelHtml = `<span class="hop-label-inline">${escapeHtml(String(h.hop || ""))}</span>`;
+        const labelIcon = L.divIcon({
+          html: labelHtml,
+          className: '',
+          iconSize: [30, 18],
+          iconAnchor: [15, -10]
+        });
+        const labelMarker = L.marker([lat, lon], { icon: labelIcon, interactive: false });
+        markersLayer.addLayer(labelMarker);
       });
 
       if (latlngs.length >= 2) {
         hopsPolyline = L.polyline(latlngs, { color: '#ff7f50', weight: 3, opacity: 0.9 }).addTo(map);
       }
 
-      setTimeout(() => fitToHops(), 200);
+      // return both lists for console rendering
+      return { plotted, skipped };
     }
 
     async function fetchTrace(alert_id) {
@@ -286,8 +301,8 @@
       const hops = res.hops || [];
       const raw = res.raw_output || "";
       const meta = { cmd: res.cmd, stderr: res.stderr };
-      renderConsoleFormatted(hops, raw, meta);
-      plotHops(hops);
+      const { plotted, skipped } = plotHops(hops);
+      renderConsoleFormatted(hops, raw, meta, plotted, skipped);
     });
 
     // Initialize
@@ -304,15 +319,14 @@
       const stored = await fetchTrace(alertId);
       if (!stored) return;
 
-      // Prefer persisted traceroute_hops if present
       const storedHops = stored.hops || stored.traceroute_hops || [];
       const raw = stored.raw_output || stored.traceroute_raw || stored.raw || "";
       const meta = (stored.traceroute_meta) ? stored.traceroute_meta : { cmd: stored.cmd, stderr: stored.stderr };
 
-      renderConsoleFormatted(storedHops, raw, meta);
-      plotHops(storedHops);
+      const { plotted, skipped } = plotHops(storedHops);
+      renderConsoleFormatted(storedHops, raw, meta, plotted, skipped);
 
-      // If focus_ip provided, open popup for that hop after plotting
+      // focus popup if requested
       if (focusIp) {
         setTimeout(() => {
           markersLayer.eachLayer(layer => {
