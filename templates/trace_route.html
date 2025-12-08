@@ -17,7 +17,6 @@
     .controls { margin-left:auto; display:flex; gap:8px; align-items:center; }
     .btn { background:var(--btn-primary); color:#fff; border:none; padding:6px 10px; border-radius:4px; cursor:pointer; }
     .btn.secondary { background:var(--btn-secondary); }
-    .hop-marker { font-weight:700; color:#000; text-align:center; }
     .trace-info { font-size:13px; line-height:1.25; }
     .muted { color:var(--muted); }
     .ns-pre { background: var(--popup-pre-bg); color: var(--popup-text); padding:6px; border-radius:4px; white-space:pre-wrap; font-family:monospace; font-size:12px; }
@@ -33,7 +32,6 @@
       border: 1px solid rgba(0,0,0,0.08);
       line-height:1;
     }
-    .skipped-header { margin-top:10px; font-weight:600; color:var(--muted); }
     @media (max-width: 900px) {
       #mapWrap { height: 55vh; }
       #console { height:45vh; }
@@ -79,6 +77,7 @@
     let hopsPolyline = null;
     let currentTheme = localStorage.getItem("netscout_theme") || "dark";
 
+    // Troy fallback coordinates for 192.168.50.*
     const TROY = { lat: 42.7284, lon: -73.6918, city: "Troy", state: "NY", country: "US" };
 
     function initMap() {
@@ -175,6 +174,11 @@
       return parts.join("");
     }
 
+    /**
+     * plotHops
+     * - plots markers with a tiny deterministic jitter when multiple hops share identical coords
+     * - draws polyline using the true coordinates (no jitter) so path remains geographically accurate
+     */
     function plotHops(hops) {
       markersLayer.clearLayers();
       if (hopsPolyline) {
@@ -182,13 +186,27 @@
         hopsPolyline = null;
       }
 
-      const latlngs = [];
+      // Build arrays and maps
       const sorted = (hops || []).slice().sort((a,b) => (a.hop||0) - (b.hop||0));
-      const skipped = [];
+      const coordKeyCounts = {}; // "lat,lon" -> count
+      const coordKeyIndices = {}; // "lat,lon" -> next index for jitter
+      const latlngsForPolyline = []; // true coords in hop order
       const plotted = [];
+      const skipped = [];
 
+      // First pass: count identical coordinate occurrences (treat null/undefined as missing)
       sorted.forEach(h => {
-        // Client-side Troy fallback for 192.168.50.*
+        const lat = (h.lat !== null && h.lat !== undefined) ? Number(h.lat) : NaN;
+        const lon = (h.lon !== null && h.lon !== undefined) ? Number(h.lon) : NaN;
+        if (isFinite(lat) && isFinite(lon)) {
+          const key = `${lat.toFixed(6)},${lon.toFixed(6)}`;
+          coordKeyCounts[key] = (coordKeyCounts[key] || 0) + 1;
+        }
+      });
+
+      // Second pass: plot markers (with jitter for duplicates) and build polyline coords
+      sorted.forEach((h, idx) => {
+        // Troy fallback client-side if server didn't provide coords
         if ((h.lat === null || h.lat === undefined || h.lon === null || h.lon === undefined) && h.ip && h.ip.startsWith("192.168.50.")) {
           h.lat = TROY.lat;
           h.lon = TROY.lon;
@@ -197,21 +215,37 @@
           h.country = h.country || TROY.country;
         }
 
-        // Coerce to numbers and validate
-        let lat = (h.lat !== null && h.lat !== undefined) ? Number(h.lat) : NaN;
-        let lon = (h.lon !== null && h.lon !== undefined) ? Number(h.lon) : NaN;
+        const lat = (h.lat !== null && h.lat !== undefined) ? Number(h.lat) : NaN;
+        const lon = (h.lon !== null && h.lon !== undefined) ? Number(h.lon) : NaN;
 
         if (!isFinite(lat) || !isFinite(lon)) {
           skipped.push(h);
           return;
         }
 
-        // valid numeric coords — plot
-        latlngs.push([lat, lon]);
-        plotted.push({ hop: h.hop, ip: h.ip, lat: lat, lon: lon });
+        // Add true coordinate to polyline array (preserve order)
+        latlngsForPolyline.push([lat, lon]);
 
-        // visible circle marker
-        const marker = L.circleMarker([lat, lon], {
+        // Determine jitter if this coordinate is shared
+        const key = `${lat.toFixed(6)},${lon.toFixed(6)}`;
+        const count = coordKeyCounts[key] || 1;
+        let jitterLat = lat;
+        let jitterLon = lon;
+        if (count > 1) {
+          // deterministic pseudo-random offset based on hop number and index
+          coordKeyIndices[key] = (coordKeyIndices[key] || 0) + 1;
+          const i = coordKeyIndices[key];
+          // small offsets in degrees (~ up to ~0.0015 deg ~ ~150m) — tiny enough to not mislead
+          const base = 0.00035; // ~39m at equator
+          // spread points in a small spiral pattern
+          const angle = (i * 2.61803398875) % (2 * Math.PI); // golden-angle-like step
+          const radius = base * (Math.ceil(i / 6)); // increase radius every 6 points
+          jitterLat = lat + Math.cos(angle) * radius;
+          jitterLon = lon + Math.sin(angle) * radius;
+        }
+
+        // Create visible circle marker at jittered position
+        const marker = L.circleMarker([jitterLat, jitterLon], {
           radius: 7,
           fillColor: "#2b9cff",
           color: "#003049",
@@ -223,23 +257,25 @@
         marker.bindPopup(buildHopPopup(h), { maxWidth: 420 });
         markersLayer.addLayer(marker);
 
-        // label icon with inline styling
+        // label icon with inline styling; anchor adjusted so label sits above jittered marker
         const labelHtml = `<span class="hop-label-inline">${escapeHtml(String(h.hop || ""))}</span>`;
         const labelIcon = L.divIcon({
           html: labelHtml,
           className: '',
           iconSize: [30, 18],
-          iconAnchor: [15, -10]
+          iconAnchor: [15, -12]
         });
-        const labelMarker = L.marker([lat, lon], { icon: labelIcon, interactive: false });
+        const labelMarker = L.marker([jitterLat, jitterLon], { icon: labelIcon, interactive: false });
         markersLayer.addLayer(labelMarker);
+
+        plotted.push({ hop: h.hop, ip: h.ip, lat: lat, lon: lon });
       });
 
-      if (latlngs.length >= 2) {
-        hopsPolyline = L.polyline(latlngs, { color: '#ff7f50', weight: 3, opacity: 0.9 }).addTo(map);
+      // Draw polyline using true coordinates (no jitter)
+      if (latlngsForPolyline.length >= 2) {
+        hopsPolyline = L.polyline(latlngsForPolyline, { color: '#ff7f50', weight: 3, opacity: 0.9 }).addTo(map);
       }
 
-      // return both lists for console rendering
       return { plotted, skipped };
     }
 
